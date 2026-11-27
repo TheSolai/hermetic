@@ -325,6 +325,11 @@ fn build(
     println!("            each one is checked. This takes a minute on a cold search.");
     let donor = hub::find_donor(signature, spec_arg, &hint);
     let Some(repo) = donor.repo.clone() else {
+        // A search that was rate-limited found nothing, and "nothing found"
+        // is a lie. If the hub did not answer, that is what is said.
+        if let Some(problem) = donor.problem.as_ref().and_then(|p| p.message()) {
+            anyhow::bail!(problem);
+        }
         let mut message = format!(
             "no model with the shape {} was found, so no adapter can be built for it.\n\
              HERMETIC can only abliterate a model it can find the original weights for.",

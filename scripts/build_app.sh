@@ -119,11 +119,29 @@ codesign --force --deep --sign - "$BUNDLE" 2>/dev/null || true
 # ── the double-clickable shortcut on the Desktop ──────────────────────────
 # The bundle is installed into ~/Applications first, so the shortcut and the
 # bundle can never disagree about which one is the real one.
+#
+# The old bundle is *moved* aside rather than deleted and copied over: the
+# copy deletes the executable out from under a running app, and the app dies
+# in the middle of whatever it was doing. A rename leaves the running app's
+# files exactly where they are.
 INSTALLED="$HOME/Applications/HERMETIC.app"
-rm -rf "$INSTALLED"
-mkdir -p "$HOME/Applications"
-cp -R "$BUNDLE" "$INSTALLED"
-codesign --force --deep --sign - "$INSTALLED" 2>/dev/null || true
+STAGED="$HOME/Applications/.HERMETIC.app.new"
+OLD="$HOME/Applications/.HERMETIC.app.old"
+
+rm -rf "$STAGED"
+cp -R "$BUNDLE" "$STAGED"
+codesign --force --deep --sign - "$STAGED" 2>/dev/null || true
+
+if [ -d "$INSTALLED" ]; then
+  rm -rf "$OLD"
+  mv "$INSTALLED" "$OLD"
+fi
+mv "$STAGED" "$INSTALLED"
+# The old bundle goes to the trash rather than being unlinked: it may still
+# be running.
+if [ -d "$OLD" ]; then
+  "$HOME/.minimax/bin/mavis-trash" -- "$OLD" >/dev/null 2>&1 || rm -rf "$OLD"
+fi
 
 DESKTOP="$HOME/Desktop/HERMETIC.command"
 cat > "$DESKTOP" <<DESKCMD

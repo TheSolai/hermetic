@@ -214,6 +214,10 @@ fn main() -> Result<()> {
         println!("engine:   {}", session.engine_dir.display());
         println!("registry: {}", session.registry_root.display());
         println!("channel:  {}", session.socket.display());
+        // The check has said what it came to say. It must leave nothing
+        // behind: a socket that nothing is listening on, and a shell that
+        // will outlive this process.
+        first.shell.stop();
         return Ok(());
     }
 

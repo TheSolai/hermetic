@@ -9,8 +9,10 @@
 //! with `mlx_lm.server`, which speaks the OpenAI chat API, so the terminal's
 //! one chat client works with it unchanged.
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -99,12 +101,14 @@ pub struct Server {
     child: Child,
     /// The port it is on.
     pub port: u16,
+    /// What the server said, so a failure can say why.
+    log: Arc<Mutex<Vec<String>>>,
 }
 
 impl Server {
     /// Start the server for a model.
     pub fn start(python: &Path, model: &Path, port: u16) -> Result<Server> {
-        let child = Command::new(python)
+        let mut child = Command::new(python)
             .arg("-m")
             .arg("mlx_lm.server")
             .arg("--model")
@@ -115,26 +119,64 @@ impl Server {
             .arg("127.0.0.1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .context("start mlx_lm.server")?;
-        Ok(Server { child, port })
+
+        // The server's own words are kept. A server that cannot load a model
+        // says why, and throwing that away leaves "it did not come up" as
+        // the only thing the user is told.
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        if let Some(stderr) = child.stderr.take() {
+            let log = Arc::clone(&log);
+            std::thread::spawn(move || {
+                let reader = std::io::BufReader::new(stderr);
+                for line in reader.lines().map_while(std::result::Result::ok) {
+                    if let Ok(mut log) = log.lock() {
+                        log.push(line);
+                        if log.len() > 30 {
+                            log.remove(0);
+                        }
+                    }
+                }
+            });
+        }
+
+        Ok(Server { child, port, log })
+    }
+
+    /// The last thing the server said.
+    fn said(&self) -> String {
+        self.log
+            .lock()
+            .ok()
+            .and_then(|log| log.last().cloned())
+            .unwrap_or_default()
     }
 
     /// Wait until the server answers.
     pub fn wait_ready(&mut self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
-            if crate::http::post_json("127.0.0.1", self.port, "/v1/models", &serde_json::json!({}))
-                .is_ok()
-            {
+            // `/v1/models` is a GET. A POST to it is answered with `405`,
+            // which is how the runtime came to think MLX could never serve
+            // anything.
+            if crate::http::get_json("127.0.0.1", self.port, "/v1/models").is_ok() {
                 return Ok(());
             }
             if let Ok(Some(status)) = self.child.try_wait() {
-                anyhow::bail!("mlx_lm.server exited with {status}");
+                let said = self.said();
+                if said.is_empty() {
+                    anyhow::bail!("mlx_lm.server exited with {status}");
+                }
+                anyhow::bail!("mlx_lm.server exited with {status}: {said}");
             }
             if Instant::now() > deadline {
-                anyhow::bail!("mlx_lm.server did not come up in time");
+                let said = self.said();
+                if said.is_empty() {
+                    anyhow::bail!("mlx_lm.server did not come up in time");
+                }
+                anyhow::bail!("mlx_lm.server did not come up in time: {said}");
             }
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -192,10 +234,14 @@ impl ModelRuntime for MlxRuntime {
             ServeMode::Native
         };
         let endpoint = crate::chat::base_url("127.0.0.1", port);
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "mlx".to_string());
+        // The server answers a request for a model by its path, and it
+        // advertises that path in `/v1/models`. Sending anything else - the
+        // name of the folder, which is a hash - makes it try to fetch a
+        // repository with that name from the hub.
+        let name = std::fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .display()
+            .to_string();
         let mut handle = ServeHandle::new(&endpoint, mode, &name);
         handle.notes.push(format!(
             "served by mlx_lm.server on port {port}, with the adapter folded into the weights"

@@ -103,3 +103,13 @@ fn an_embedding_model_has_no_donor_and_says_so() {
     let donor = hermetic_core::hub::find_donor(&signature, "nomic-embed-text:latest", &hint);
     println!("nomic-embed-text:latest -> {donor:?}");
 }
+
+#[test]
+#[ignore = "talks to the hub and to Ollama"]
+fn a_model_without_a_name_in_its_weights_still_finds_them() {
+    // `phi4:14b` is a `microsoft/phi-4`, and llama.cpp calls that
+    // architecture `phi3` - so neither the architecture nor the name in the
+    // weights gets there. The hub's own search does.
+    let repo = donor_for("phi4:14b").expect("a donor for phi4:14b");
+    println!("phi4:14b -> {repo}");
+}

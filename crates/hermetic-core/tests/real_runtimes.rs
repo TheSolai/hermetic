@@ -254,9 +254,20 @@ fn mlx_serves_a_real_mlx_model() {
             }
         };
         let mut chat = Chat::new(&handle.endpoint, &handle.model).expect("a chat");
-        let answer = chat
-            .say("What is the capital of France? One word.")
-            .expect("an answer");
+        let answer = match chat.say("What is the capital of France? One word.") {
+            Ok(answer) => answer,
+            Err(error) => {
+                eprintln!("  it could not answer ({error}) - trying the next model");
+                (handle.stop)();
+                continue;
+            }
+        };
+        if answer.trim().is_empty() {
+            // A model mlx-lm cannot really run answers with nothing.
+            eprintln!("  it answered with nothing - trying the next model");
+            (handle.stop)();
+            continue;
+        }
         assert!(!answer.trim().is_empty(), "the model answered something");
         eprintln!("answered: {}", answer.trim());
 

@@ -168,26 +168,126 @@ fn repo_shape(repo: &str, known_to_exist: bool) -> Shape {
     }
 }
 
+/// What went wrong while asking the hub.
+///
+/// The hub rate-limits, and a rate-limited answer is an empty one: the
+/// search finds nothing, and "nothing found" is a lie - the model is there,
+/// the hub was busy. So what happened is kept, and the search says it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HubProblem {
+    /// The hub said it was too busy.
+    pub rate_limited: bool,
+    /// The hub could not be reached at all.
+    pub unreachable: bool,
+    /// How many questions went unanswered.
+    pub failures: usize,
+}
+
+impl HubProblem {
+    /// Did anything go wrong?
+    pub fn is_none(&self) -> bool {
+        self.failures == 0
+    }
+
+    /// What to tell the user about it.
+    pub fn message(&self) -> Option<String> {
+        if self.failures == 0 {
+            return None;
+        }
+        if self.rate_limited {
+            return Some(
+                "the hub was rate-limiting the search, so it did not answer every \
+                 question it was asked.\nThis is not a missing model - it is a busy \
+                 hub. Wait a minute and try again."
+                    .into(),
+            );
+        }
+        if self.unreachable {
+            return Some(
+                "the hub could not be reached, so the search is incomplete.\nThis is \
+                 not a missing model - it is a hub that did not answer."
+                    .into(),
+            );
+        }
+        Some(format!(
+            "the hub did not answer {} of the questions it was asked, so the search \
+             is incomplete.\nThis is not a missing model.",
+            self.failures
+        ))
+    }
+
+    /// Fold one failure into this.
+    fn record(&mut self, code: Option<&str>) {
+        self.failures += 1;
+        match code {
+            Some("429") => self.rate_limited = true,
+            Some(_) => {}
+            None => self.unreachable = true,
+        }
+    }
+}
+
 /// Ask the hub for repositories with a name like `query`.
 ///
 /// The results are sorted by downloads: the model everybody actually uses
 /// comes first, and not somebody's re-upload of it.
 pub fn search(query: &str, limit: usize) -> Vec<String> {
+    search_with_problem(query, limit).0
+}
+
+/// Ask the hub, and say what went wrong if something did.
+///
+/// The hub rate-limits, and a busy hub answers with an empty body and a
+/// `429`. That is not an answer, so it is waited out and asked again: a
+/// search that gives up on the first refusal is a search that finds
+/// nothing, and "nothing found" is a lie.
+fn search_with_problem(query: &str, limit: usize) -> (Vec<String>, Option<HubProblem>) {
     let url = format!(
         "https://huggingface.co/api/models?search={}&sort=downloads&limit={limit}",
         query.replace(' ', "+")
     );
-    let Some(value) = get_json(&url) else {
-        return Vec::new();
-    };
-    let Some(items) = value.as_array() else {
-        return Vec::new();
-    };
-    items
-        .iter()
-        .filter_map(|m| m.get("id").and_then(|i| i.as_str()))
-        .map(|s| s.to_string())
-        .collect()
+    let mut trouble: Option<HubProblem> = None;
+    for attempt in 0..4u64 {
+        let (body, code) = match get_with_status(&url) {
+            Some(pair) => pair,
+            None => {
+                let mut problem = HubProblem::default();
+                problem.record(None);
+                trouble = Some(problem);
+                std::thread::sleep(std::time::Duration::from_secs(2 * (attempt + 1)));
+                continue;
+            }
+        };
+        if code == "429" {
+            let mut problem = HubProblem::default();
+            problem.record(Some("429"));
+            trouble = Some(problem);
+            std::thread::sleep(std::time::Duration::from_secs(3 * (attempt + 1)));
+            continue;
+        }
+        if code != "200" {
+            let mut problem = HubProblem::default();
+            problem.record(Some(&code));
+            return (Vec::new(), Some(problem));
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&body) else {
+            let mut problem = HubProblem::default();
+            problem.record(Some(&code));
+            return (Vec::new(), Some(problem));
+        };
+        let Some(items) = value.as_array() else {
+            let mut problem = HubProblem::default();
+            problem.record(Some(&code));
+            return (Vec::new(), Some(problem));
+        };
+        let repos: Vec<String> = items
+            .iter()
+            .filter_map(|m| m.get("id").and_then(|i| i.as_str()))
+            .map(|s| s.to_string())
+            .collect();
+        return (repos, None);
+    }
+    (Vec::new(), trouble)
 }
 
 /// The organisations that publish models of this architecture.
@@ -336,6 +436,11 @@ pub struct Donor {
     /// or the hub might be having a bad afternoon. The next one is then
     /// tried, and the one after that.
     pub alternatives: Vec<String>,
+    /// What went wrong with the search, if anything did.
+    ///
+    /// A search that was rate-limited found nothing, and "nothing found" is
+    /// a lie - so this says what actually happened.
+    pub problem: Option<HubProblem>,
 }
 
 impl Donor {
@@ -616,7 +721,11 @@ fn hf_candidates(spec: &str, hint: &Hint) -> Vec<String> {
 ///
 /// The count is the filter that matters: a distilled model has the count of
 /// the model it was distilled from, and nothing else does.
-fn counted_candidates(spec: &str, hint: &Hint) -> Vec<String> {
+fn counted_candidates(
+    spec: &str,
+    hint: &Hint,
+    problem: &mut HubProblem,
+) -> Vec<String> {
     let Some(parameters) = hint.parameters else {
         return Vec::new();
     };
@@ -645,7 +754,11 @@ fn counted_candidates(spec: &str, hint: &Hint) -> Vec<String> {
 
     let mut repos: Vec<String> = Vec::new();
     for query in queries {
-        for repo in search(&query, 12) {
+        let (found, trouble) = search_with_problem(&query, 12);
+        if let Some(trouble) = trouble {
+            problem.record(Some(if trouble.rate_limited { "429" } else { "000" }));
+        }
+        for repo in found {
             // A re-upload of quantised weights is not a donor: Heretic needs
             // the original tensors, and a GGUF repo does not have them.
             if !is_derivative(&repo) && !repos.contains(&repo) {
@@ -753,8 +866,13 @@ pub fn find_donor(target: &Signature, spec: &str, hint: &Hint) -> Donor {
     // distilled model from the model it was distilled from - they are the
     // same shape by construction - but the adapter has to be made on the
     // right one, or the weights answer in nonsense.
+    let mut problem = HubProblem::default();
     for query in name_queries(hint) {
-        for repo in search(&query, 12) {
+        let (found, trouble) = search_with_problem(&query, 12);
+        if let Some(trouble) = trouble {
+            problem.record(Some(if trouble.rate_limited { "429" } else { "000" }));
+        }
+        for repo in found {
             // A re-upload of quantised weights is not a donor: Heretic needs
             // the original tensors, and a GGUF repo does not have them.
             if !is_derivative(&repo) && !candidates.contains(&repo) {
@@ -770,7 +888,7 @@ pub fn find_donor(target: &Signature, spec: &str, hint: &Hint) -> Donor {
 
     // These were returned by the hub's own search, so they exist. That is
     // what tells a gated repository from one that was never there.
-    let found = counted_candidates(spec, hint);
+    let found = counted_candidates(spec, hint, &mut problem);
     let exists: Vec<String> = found.clone();
     candidates.extend(found);
 
@@ -810,6 +928,7 @@ pub fn find_donor(target: &Signature, spec: &str, hint: &Hint) -> Donor {
         repo,
         gated,
         alternatives,
+        problem: if problem.is_none() { None } else { Some(problem) },
     }
 }
 
