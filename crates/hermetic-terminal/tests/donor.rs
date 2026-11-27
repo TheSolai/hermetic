@@ -9,8 +9,8 @@
 //!
 //! What they check is the thing that actually breaks in the field: a model
 //! whose *name* does not describe its weights. `deepseek-r1:8b` is a
-//! `Qwen3-8B`, and `Qwen:latest` is a `Qwen2.5` of some size. The search has
-//! to reach the original weights from that.
+//! `Qwen3-8B`, and `Qwen:latest` is a `Qwen1.5-4B-Chat` called something
+//! else entirely. The search has to reach the original weights from that.
 
 use hermetic_terminal::spec::{hint_of, shape_of, source_of};
 
@@ -52,4 +52,38 @@ fn a_qwen_family_model_finds_its_weights() {
     let repo = donor_for("qwen2.5-coder:7b").expect("a donor for qwen2.5-coder:7b");
     println!("qwen2.5-coder:7b -> {repo}");
     assert!(repo.contains("Qwen2.5"), "unexpected donor: {repo}");
+}
+
+#[test]
+#[ignore = "talks to the hub and to Ollama"]
+fn a_vision_model_finds_the_model_it_was_built_on() {
+    // `llava:34b` is a LLaVA wrapper around Llama-3-34B, and its own weights
+    // say nothing useful: the GGUF calls itself "LLaMA v2". Any repository
+    // with the same shape will do - the adapter is what has to line up.
+    let repo = donor_for("llava:34b").expect("a donor for llava:34b");
+    println!("llava:34b -> {repo}");
+}
+
+#[test]
+#[ignore = "talks to the hub and to Ollama"]
+fn a_mixture_of_experts_finds_its_weights() {
+    // `qwen35moe` is a 35B mixture of experts, published under a name the
+    // architecture does not give away, and carrying an extra block for
+    // multi-token prediction that the original weights do not have.
+    let repo = donor_for(
+        "llamacpp:782c715f39fee143c2dcc3812552f805b75d48f143f98a3ccd7b75123b558992",
+    )
+    .expect("a donor for the qwen35moe model");
+    println!("qwen35moe -> {repo}");
+}
+
+#[test]
+#[ignore = "talks to the hub and to Ollama"]
+fn an_embedding_model_has_no_donor_and_says_so() {
+    // `nomic-embed-text` is not a chat model at all.
+    let source = source_of("nomic-embed-text:latest").expect("a source");
+    let signature = shape_of(&source).expect("a shape");
+    let hint = hint_of(&source, &signature);
+    let donor = hermetic_core::hub::find_donor(&signature, "nomic-embed-text:latest", &hint);
+    println!("nomic-embed-text:latest -> {donor:?}");
 }

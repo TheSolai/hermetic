@@ -58,8 +58,18 @@ impl Signature {
     }
 
     /// Do these two shapes match, as far as an adapter cares?
+    ///
+    /// The direction matters. The adapter is built from the *donor* and bound
+    /// to the *target*, so the donor may have fewer layers than the target -
+    /// a model that predicts more than one token at a time carries an extra
+    /// block for it, the MTP layer, and llama.cpp counts that block. The
+    /// adapter has no tensors for it, and llama.cpp binds the adapter anyway.
+    /// The other way round would mean an adapter with tensors the model does
+    /// not have, which llama.cpp refuses.
     pub fn matches(&self, other: &Signature) -> bool {
-        self.layers == other.layers
+        let layers_fit = other.layers == self.layers
+            || (other.layers > self.layers && other.layers - self.layers == 1);
+        layers_fit
             && self.hidden == other.hidden
             && self.inter == other.inter
     }
@@ -72,6 +82,15 @@ impl Signature {
 
     /// The shape, read from a Hugging Face `config.json`.
     pub fn from_hf_config(config: &Value) -> Result<Signature> {
+        // A model that is more than a language model keeps its shape in a
+        // nested config: `Qwen3.5-35B-A3B` puts everything in `text_config`.
+        let config = if config.get("num_hidden_layers").is_some() {
+            config
+        } else if let Some(text) = config.get("text_config") {
+            text
+        } else {
+            config
+        };
         let arch = config
             .get("model_type")
             .and_then(|v| v.as_str())

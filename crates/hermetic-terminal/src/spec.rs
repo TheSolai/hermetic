@@ -192,6 +192,29 @@ pub fn hint_of(source: &ModelSource, signature: &Signature) -> hermetic_core::hu
     hint
 }
 
+/// What Ollama says a model can do.
+///
+/// An embedding model can do one thing, and it is not talking.
+pub fn capabilities_of(source: &ModelSource) -> Vec<String> {
+    match source {
+        ModelSource::Ollama { name } => ollama_show(name)
+            .and_then(|answer| {
+                answer
+                    .get("capabilities")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+            })
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 /// A model's `config.json`, when it has one.
 fn read_config(directory: &Path) -> Option<serde_json::Value> {
     let text = std::fs::read_to_string(directory.join("config.json")).ok()?;
@@ -219,17 +242,25 @@ fn ollama_shape(name: &str) -> Option<Signature> {
 /// from.
 pub fn ollama_info(name: &str) -> Option<serde_json::Value> {
     let (host, port) = hermetic_core::runtimes::ollama::ollama_addr();
-    let answer = hermetic_core::http::post_json(
+    ollama_show(name)
+        .and_then(|answer| {
+            answer
+                .get("model_info")
+                .and_then(|m| m.as_object())
+                .map(|m| serde_json::Value::Object(m.clone()))
+        })
+}
+
+/// Everything Ollama says about one of its models.
+pub fn ollama_show(name: &str) -> Option<serde_json::Value> {
+    let (host, port) = hermetic_core::runtimes::ollama::ollama_addr();
+    hermetic_core::http::post_json(
         &host,
         port,
         "/api/show",
         &serde_json::json!({ "name": name }),
     )
-    .ok()?;
-    answer
-        .get("model_info")
-        .and_then(|m| m.as_object())
-        .map(|m| serde_json::Value::Object(m.clone()))
+    .ok()
 }
 
 /// Split a remote spec into its base URL and the model on that server.

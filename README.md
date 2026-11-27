@@ -128,16 +128,26 @@ So the search is driven by the shape and the parameter count
    `Qwen/Qwen2.5-3B`; llama.cpp only tells you the architecture is `qwen2`,
    so the minor version is guessed (`Qwen2`, `Qwen2.5`, `Qwen2.0`) and
    crossed with the organisations that publish models of that family.
-3. **The hub's search, filtered by the parameter count**, which is exact
-   enough to leave a handful of candidates. Ollama knows the count exactly
-   (`general.parameter_count`), and the hub knows each repository's count
-   (`safetensors.total`).
-4. **The shape, checked to the digit.** The shape is the only thing that is
-   actually right, so it is what decides.
+3. **Every version of the family.** llama.cpp calls every Llama model
+   `llama`, but the hub has `Llama-2`, `Llama-3`, `Llama-3.1` and `Llama-3.2`
+   as separate repositories, and the version is nowhere in the architecture.
+   So it is guessed - `Llama-3`, `Gemma-2`, `Qwen3.5` - and the shape check
+   decides which guess was right.
+4. **The hub's search, with the size in the query.** `Llama-3-34B` is the
+   query that finds the public mirrors of a gated model - the ones everybody's
+   download count is on, not the original. The results are then filtered by
+   the parameter count, which Ollama knows exactly (`general.parameter_count`)
+   and the hub knows exactly (`safetensors.total`), and asked about in
+   parallel, because the hub is slow one request at a time.
+5. **The shape, checked to the digit.** The shape is the only thing that is
+   actually right, so it is what decides. A model that predicts more than one
+   token at a time carries an extra block for it, and the original weights do
+   not, so one layer of difference is allowed - in that direction only.
 
-Repositories that are gated are reported as gated - with the hub's own
-`gated` field, because a `401` on a download means "gated" or "does not
-exist" and nothing else. `HF_TOKEN` unlocks the first.
+Repositories that are gated are reported as gated, and the hub cannot tell a
+gated repository from one that was never there: it answers `401` for both. So
+the hub's own search is the oracle - a repository it returned exists - and
+`HF_TOKEN` unlocks the gated ones.
 
 The search is tested against the real hub, not only against mocks:
 

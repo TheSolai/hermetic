@@ -41,11 +41,30 @@ fn auth_args() -> Vec<String> {
     args
 }
 
+/// The arguments every request to the hub is made with.
+///
+/// The hub rate-limits, and a search can bring back a hundred names to check.
+/// The retry is not politeness: without it, a rate-limited reply looks like a
+/// repository that does not exist, and the donor is lost.
+fn curl_args() -> Vec<String> {
+    let mut args = vec![
+        "-sL".to_string(),
+        "--max-time".to_string(),
+        "20".to_string(),
+        "--retry".to_string(),
+        "3".to_string(),
+        "--retry-delay".to_string(),
+        "2".to_string(),
+        "--retry-all-errors".to_string(),
+    ];
+    args.extend(auth_args());
+    args
+}
+
 /// Fetch a URL and parse it as JSON.
 fn get_json(url: &str) -> Option<Value> {
     let mut command = Command::new("curl");
-    command.args(["-sL", "--max-time", "20"]);
-    for argument in auth_args() {
+    for argument in curl_args() {
         command.arg(argument);
     }
     let out = command.arg(url).output().ok()?;
@@ -56,8 +75,7 @@ fn get_json(url: &str) -> Option<Value> {
 /// Fetch a URL and read its body and its status code.
 fn get_with_status(url: &str) -> Option<(String, String)> {
     let mut command = Command::new("curl");
-    command.args(["-sL", "--max-time", "20"]);
-    for argument in auth_args() {
+    for argument in curl_args() {
         command.arg(argument);
     }
     let out = command
@@ -113,21 +131,29 @@ enum Shape {
 }
 
 /// Read a repo's `config.json` and work out its shape.
-fn repo_shape(repo: &str) -> Shape {
+fn repo_shape(repo: &str, known_to_exist: bool) -> Shape {
     let url = format!("https://huggingface.co/{repo}/resolve/main/config.json");
     let Some((body, code)) = get_with_status(&url) else {
         return Shape::Missing;
     };
     match code.as_str() {
         "200" => {}
-        // The download was refused. That is not proof of anything: the hub
-        // answers 401 for a repository that does not exist as well as for one
-        // that is gated. Only the repository's own record can tell them
-        // apart.
+        // The download was refused. The hub answers 401 for a repository that
+        // does not exist as well as for one that is gated, and without a token
+        // its own record cannot tell them apart either. What can tell them
+        // apart is the hub's search: a repository it returns exists, and one
+        // it never returned does not.
         "401" | "403" => {
             return match repo_info(repo) {
                 Some(info) if info.gated => Shape::Gated,
-                _ => Shape::Missing,
+                Some(_) => Shape::Missing,
+                None => {
+                    if known_to_exist {
+                        Shape::Gated
+                    } else {
+                        Shape::Missing
+                    }
+                }
             };
         }
         _ => return Shape::Missing,
@@ -339,12 +365,48 @@ const ROLE_WORDS: &[&str] = &[
     "hf",
 ];
 
-/// The families a model can belong to, spelled the way repositories spell them.
+/// The families an architecture is published under.
 ///
-/// The architecture alone is not enough: llama.cpp calls every Qwen 2.x model
-/// `qwen2`, but the hub has `Qwen2-32B` and `Qwen2.5-32B` as separate
-/// repositories. The minor version is the difference between finding the
-/// donor and not finding it.
+/// llama.cpp calls every Llama model `llama`, but the hub has `Llama-2`,
+/// `Llama-3`, `Llama-3.1` and `Llama-3.2` as separate repositories, and the
+/// version is nowhere in the architecture. It has to be guessed, and the
+/// shape check decides which guess was right.
+fn arch_families(arch: &str) -> Vec<String> {
+    let lower = arch.to_lowercase();
+    // `qwen35moe` is `qwen35` with a note about the experts.
+    let base = lower
+        .trim_end_matches("moe")
+        .trim_end_matches("_lite")
+        .trim_end_matches("lite");
+    let word = capitalise(base);
+    let mut out = vec![word.clone()];
+
+    // `qwen35` is `Qwen3.5`, and `qwen2` is `Qwen2.5`.
+    if let Some((letters, digits)) = base.split_once(|c: char| c.is_ascii_digit()) {
+        if digits.len() == 2 {
+            let (major, minor) = digits.split_at(1);
+            out.push(format!("{}{}.{}", capitalise(letters), major, minor));
+        }
+        if digits.len() == 1 {
+            out.push(format!("{word}.5"));
+            out.push(format!("{word}.0"));
+        }
+    } else {
+        // A family without a version in its name is published in several:
+        // `Llama`, `Llama-2`, `Llama-3`, `Llama-3.1`.
+        for version in ["2", "3", "3.1", "3.2", "3.5", "3.6", "3.8", "4"] {
+            out.push(format!("{word}-{version}"));
+        }
+        if word.starts_with("Deepseek") {
+            for version in ["V2", "V3"] {
+                out.push(format!("{word}-{version}"));
+            }
+        }
+    }
+    out
+}
+
+/// The families a model can belong to, spelled the way repositories spell them.
 fn family_spellings(spec: &str, hint: &Hint) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push = |value: String| {
@@ -353,13 +415,27 @@ fn family_spellings(spec: &str, hint: &Hint) -> Vec<String> {
         }
     };
 
-    // The model's own name is the best family we have: `qwen2.5-coder` says
+    // The weights know their own name. It is the best hint there is - and it
+    // is also often old, which the hub sorts out by redirect.
+    if let Some(name) = &hint.name {
+        if !name.contains(' ') {
+            push(name.clone());
+        }
+        let trimmed: Vec<&str> = name
+            .split('-')
+            .filter(|part| !ROLE_WORDS.contains(&part.to_lowercase().as_str()))
+            .collect();
+        if !trimmed.is_empty() && !trimmed.join("-").contains(' ') {
+            push(capitalise(&trimmed.join("-")));
+        }
+    }
+
+    // The model's own name is the next best thing: `qwen2.5-coder` says
     // `Qwen2.5`, even though llama.cpp only says `qwen2`.
     let (name, _) = split_tag(spec);
     let base = name.rsplit('/').next().unwrap_or(name);
     if !base.is_empty() {
         push(capitalise(base));
-        // Drop the role words: `Qwen2.5-Coder` -> `Qwen2.5`.
         let trimmed: Vec<&str> = base
             .split('-')
             .filter(|part| !ROLE_WORDS.contains(&part.to_lowercase().as_str()))
@@ -369,15 +445,10 @@ fn family_spellings(spec: &str, hint: &Hint) -> Vec<String> {
         }
     }
 
-    // The architecture, with the minor version it hides.
+    // The architecture, with every version it hides.
     if let Some(arch) = &hint.architecture {
-        let family = capitalise(arch);
-        let versioned = family.chars().last().is_some_and(|c| c.is_ascii_digit());
-        push(family.clone());
-        if versioned {
-            for minor in [".5", ".0"] {
-                push(format!("{family}{minor}"));
-            }
+        for family in arch_families(arch) {
+            push(family);
         }
     }
 
@@ -456,14 +527,16 @@ fn hf_candidates(spec: &str, hint: &Hint) -> Vec<String> {
         // renamed since, but the hub redirects an old name to the new one,
         // so the name the file was made with still finds it.
         if let Some(name) = &hint.name {
-            let repo = format!("{org}/{name}");
-            if !out.contains(&repo) {
-                out.push(repo);
+            if !name.contains(' ') {
+                let repo = format!("{org}/{name}");
+                if !out.contains(&repo) {
+                    out.push(repo);
+                }
             }
         }
         for family in &families {
             for size in &sizes {
-                for suffix in ["", "-Instruct", "-Base", "-it", "-Chat"] {
+                for suffix in ["", "-Instruct", "-it"] {
                     let repo = format!("{org}/{family}-{size}{suffix}");
                     if !out.contains(&repo) {
                         out.push(repo);
@@ -475,29 +548,98 @@ fn hf_candidates(spec: &str, hint: &Hint) -> Vec<String> {
     out
 }
 
-/// The hub's search, by architecture, with the parameter count as a filter.
-fn counted_candidates(hint: &Hint) -> Vec<String> {
-    let mut out = Vec::new();
-    let (Some(arch), Some(parameters)) = (&hint.architecture, hint.parameters) else {
-        return out;
+/// The hub's search, by family, with the parameter count as a filter.
+///
+/// The count is the filter that matters: a distilled model has the count of
+/// the model it was distilled from, and nothing else does.
+fn counted_candidates(spec: &str, hint: &Hint) -> Vec<String> {
+    let Some(parameters) = hint.parameters else {
+        return Vec::new();
     };
-    for repo in search(arch, 50) {
-        if is_derivative(&repo) {
-            continue;
+
+    // Every family the model might be published under, and the hub's own
+    // search for it.
+    let mut queries = family_spellings(spec, hint);
+    let (name, _) = split_tag(spec);
+    let base = name.rsplit('/').next().unwrap_or(name);
+    if !base.is_empty() {
+        queries.push(base.to_string());
+        queries.push(base.replace('-', " "));
+    }
+
+    // The family with the size in the query: `Llama-3-34B`. This is the
+    // query that finds the public mirrors of a gated model - the ones that
+    // everybody's download count is on, not the original.
+    let sizes = size_candidates(hint);
+    let mut with_size = Vec::new();
+    for family in family_spellings(spec, hint) {
+        for size in &sizes {
+            with_size.push(format!("{family}-{size}"));
         }
-        let Some(info) = repo_info(&repo) else {
-            continue;
-        };
-        let Some(total) = info.parameters else {
+    }
+    queries.extend(with_size);
+
+    let mut repos: Vec<String> = Vec::new();
+    for query in queries {
+        for repo in search(&query, 12) {
+            // A re-upload of quantised weights is not a donor: Heretic needs
+            // the original tensors, and a GGUF repo does not have them.
+            if !is_derivative(&repo) && !repos.contains(&repo) {
+                repos.push(repo);
+            }
+        }
+        // The hub rate-limits. Ten queries at a time is plenty.
+        if repos.len() > 120 {
+            break;
+        }
+    }
+
+    // The hub is slow one request at a time, and a search brings back twenty
+    // names to check, so they are asked about in parallel.
+    let mut out = Vec::new();
+    for (repo, info) in repo_infos(&repos) {
+        let Some(total) = info.and_then(|i| i.parameters) else {
             continue;
         };
         // Two percent: tied embeddings and a slightly different head can move
         // the count by a little.
         let difference = (total as f64 - parameters as f64).abs() / parameters as f64;
-        if difference < 0.02 && !out.contains(&repo) {
+        if difference < 0.02 {
             out.push(repo);
         }
     }
+    out
+}
+
+/// Ask the hub about many repositories at once.
+///
+/// The hub is slow one request at a time, and a search brings back a dozen
+/// names to check - so they are asked about in parallel, but only three at a
+/// time, because the hub rate-limits and a rate-limited reply looks like a
+/// repository that does not exist.
+fn repo_infos(repos: &[String]) -> Vec<(String, Option<RepoInfo>)> {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().min(3))
+        .unwrap_or(2)
+        .max(1);
+    let chunk = (repos.len() + workers - 1) / workers;
+    let mut out: Vec<(String, Option<RepoInfo>)> = Vec::new();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for part in repos.chunks(chunk.max(1)) {
+            handles.push(scope.spawn(move || {
+                part.iter()
+                    .map(|repo| (repo.clone(), repo_info(repo)))
+                    .collect::<Vec<_>>()
+            }));
+        }
+        for handle in handles {
+            match handle.join() {
+                Ok(part) => out.extend(part),
+                Err(_) => {}
+            }
+        }
+    });
     out
 }
 
@@ -512,24 +654,17 @@ pub fn find_donor(target: &Signature, spec: &str, hint: &Hint) -> Donor {
     // The matrix leads, because it reaches the donor without a search.
     candidates.extend(hf_candidates(spec, hint));
     candidates.extend(name_candidates(hint));
-    candidates.extend(counted_candidates(hint));
 
-    // The hub's own search finds repos the matrix never guesses.
-    let (name, _) = split_tag(spec);
-    let base = name.rsplit('/').next().unwrap_or(name);
-    for query in [base.to_string(), base.replace('-', " ")] {
-        // A re-upload of quantised weights is not a donor: Heretic needs the
-        // original tensors, and a GGUF repo does not have them.
-        for repo in search(&query, 25) {
-            if !is_derivative(&repo) && !candidates.contains(&repo) {
-                candidates.push(repo);
-            }
-        }
-    }
+    // These were returned by the hub's own search, so they exist. That is
+    // what tells a gated repository from one that was never there.
+    let found = counted_candidates(spec, hint);
+    let exists: Vec<String> = found.clone();
+    candidates.extend(found);
 
     let mut gated: Vec<String> = Vec::new();
     for repo in candidates {
-        match repo_shape(&repo) {
+        let known = exists.iter().any(|known| known == &repo);
+        match repo_shape(&repo, known) {
             Shape::Known(signature) => {
                 if signature.matches(target) {
                     return Donor {

@@ -251,6 +251,20 @@ fn prepare(
         return Ok((None, None, false));
     };
 
+    // An embedding model is not a chat model. There is no chat endpoint to
+    // bind an adapter to, and saying so is better than an hour of looking
+    // for weights that will never be served.
+    let capabilities = spec::capabilities_of(source);
+    if capabilities.iter().any(|c| c == "embedding")
+        && !capabilities.iter().any(|c| c == "completion")
+    {
+        anyhow::bail!(
+            "{spec_arg} is an embedding model, not a chat model.\n\
+             HERMETIC serves models you talk to: an embedding model has no chat \
+             endpoint for an adapter to be bound to."
+        );
+    }
+
     let base = weights::weights_for(source, registry);
     let adapter = registry.adapter_for(signature);
 

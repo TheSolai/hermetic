@@ -448,11 +448,33 @@ def install() -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--heretical-events-file", default=None)
-    parser.add_argument("--hermetic-socket", default=None)
-    parser.add_argument("--heretical-policy", default="auto", choices=["auto", "first"])
+    # Both spellings are accepted: the client may use the "hermetic" prefix
+    # (the engine's own name) or the "heretical" one. The first spelling of
+    # each pair wins and the attribute is the same either way, so the two
+    # sides can never disagree about the name of a flag.
+    parser.add_argument(
+        "--hermetic-events-file",
+        "--heretical-events-file",
+        dest="events_file",
+        default=None,
+    )
+    parser.add_argument(
+        "--hermetic-socket",
+        "--heretical-socket",
+        dest="socket_path",
+        default=None,
+    )
+    parser.add_argument(
+        "--hermetic-policy",
+        "--heretical-policy",
+        dest="policy",
+        default="auto",
+        choices=["auto", "first"],
+    )
     parser.add_argument(
         "--hermetic-label",
+        "--heretical-label",
+        dest="label",
         default=None,
         help="what the client should call this run, e.g. the model being worked on",
     )
@@ -460,13 +482,17 @@ def main() -> int:
 
     global CHANNEL
     CHANNEL = Channel(
-        file_path=known.heretical_events_file or os.environ.get("HERETICAL_CHANNEL_FILE"),
-        socket_path=known.hermetic_socket or os.environ.get("HERMETIC_CHANNEL_SOCKET"),
+        file_path=known.events_file
+        or os.environ.get("HERMETIC_CHANNEL_FILE")
+        or os.environ.get("HERETICAL_CHANNEL_FILE"),
+        socket_path=known.socket_path
+        or os.environ.get("HERMETIC_CHANNEL_SOCKET")
+        or os.environ.get("HERETICAL_CHANNEL_SOCKET"),
     )
 
-    if known.hermetic_label:
+    if known.label:
         # So the client can tell several running engines apart.
-        emit("build_start", label=known.hermetic_label)
+        emit("build_start", label=known.label)
 
     install()
 
