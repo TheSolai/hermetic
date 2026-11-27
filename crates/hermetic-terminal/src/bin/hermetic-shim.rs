@@ -207,6 +207,24 @@ fn probe_for(registry: &Registry, signature: &Option<hermetic_core::Signature>) 
     Some(probe)
 }
 
+/// Fetch a model from Ollama's library.
+///
+/// The shell aliases `ollama` to the helper, but an alias belongs to the
+/// shell: a program started from here gets the real one.
+fn pull(name: &str) -> bool {
+    let Some(ollama) = hermetic_terminal::which("ollama") else {
+        return false;
+    };
+    let status = std::process::Command::new(&ollama)
+        .arg("pull")
+        .arg(name)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    matches!(status, Ok(s) if s.success())
+}
+
 /// Ask the model the questions, and count the answers that match.
 fn run_probe(endpoint: &str, model: &str, probe: &Probe) -> ProbeResult {
     let Ok((host, port)) = hermetic_core::chat::split_endpoint(endpoint) else {
@@ -274,7 +292,25 @@ fn run(spec_arg: &str) -> Result<()> {
     let source =
         spec::source_of(spec_arg).with_context(|| format!("could not resolve '{spec_arg}'"))?;
     let registry = Registry::new();
-    let signature = spec::shape_of(&source);
+    let mut signature = spec::shape_of(&source);
+
+    // A model that is not on this machine yet has no weights to read, so it
+    // has no shape, so no adapter can be bound to it - and it is served as it
+    // is, with a prompt-level policy. But Ollama downloads the model when it
+    // is asked to serve it, so the download happens either way. Doing it
+    // first means the weights are here to be read and changed.
+    if signature.is_none() {
+        if let ModelSource::Ollama { name } = &source {
+            println!("  note      this model is not on this machine yet");
+            println!("            it is being fetched, so its weights can be read and changed");
+            if pull(name) {
+                signature = spec::shape_of(&source);
+                if signature.is_some() {
+                    println!("            it is here now");
+                }
+            }
+        }
+    }
 
     banner();
     println!("  model     {}", source.label());

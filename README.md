@@ -171,6 +171,20 @@ cargo test --release --test donor -- --ignored --nocapture
 # deepseek-r1:latest -> deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
 ```
 
+## Does it actually work?
+
+HERMETIC does not take "the adapter was built" for an answer. After a model
+is served, it is asked the questions it was judged on - the prompts and the
+markers come from the scorer upstream Heretic used - and the answers are
+counted. The score of the untouched model goes with them:
+
+```
+probe    Refusals 2/16 · the untouched model refused 94%
+```
+
+The probe runs in the background, so the model is ready to talk to at once,
+and the answer arrives a moment later.
+
 ## Which ablation is kept
 
 Heretic tries a number of ways to remove a model's refusals, scores each one,
