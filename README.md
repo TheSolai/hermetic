@@ -171,6 +171,26 @@ cargo test --release --test donor -- --ignored --nocapture
 # deepseek-r1:latest -> deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
 ```
 
+## Which ablation is kept
+
+Heretic tries a number of ways to remove a model's refusals, scores each one,
+and keeps the best. "Best" is not obvious, because the scorers disagree about
+what matters: one of them counts refusals, the other measures how far the
+model has moved from what it was.
+
+Upstream sorts its Pareto front by the scorers one after another, so the trial
+that refuses **not at all** comes first - whatever it has cost the model. On
+gemma-2-2b that is the difference between a KL divergence of 0.08 and one of
+8.79, and the second one does not speak any more: it answers in gibberish.
+
+So the bridge takes the trial with the **lowest total score** instead: the one
+that refuses less *and* keeps the model closest to what it was. The build log
+says which trial it kept:
+
+```
+keeping trial 1 - the trial with the lowest total score (0.179)
+```
+
 ## What is in the box
 
 | | |
