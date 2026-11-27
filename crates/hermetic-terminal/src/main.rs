@@ -10,6 +10,7 @@
 //! a unix socket: the terminal keeps a side panel with the phase, the scores
 //! and the log.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -243,6 +244,59 @@ fn main() -> Result<()> {
     result
 }
 
+/// The bytes that give the terminal back.
+///
+/// Rust's stdout is line-buffered, and an escape sequence has no newline in
+/// it: written through the buffer, it never leaves - the process dies with
+/// the sequence still in it, and the terminal is left in the alternate
+/// screen with the mouse captured. So these bytes go straight to the
+/// terminal instead.
+const RESTORE_TERMINAL: &[u8] =
+    b"\x1b[?1049l\x1b[?1003l\x1b[?1002l\x1b[?1006l\x1b[?25h";
+
+/// Give the terminal back to the user.
+///
+/// This runs on the way out, on a panic, and on a signal: whatever happens,
+/// the screen is left the way it was found.
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let mut out = std::io::stdout();
+    let _ = execute!(
+        out,
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        crossterm::cursor::Show
+    );
+    let _ = out.flush();
+}
+
+/// Stop the terminal when it is told to.
+fn install_signal_handlers() {
+    unsafe {
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            libc::signal(
+                signal,
+                handle_signal as *const () as libc::sighandler_t,
+            );
+        }
+    }
+}
+
+/// What a signal does to the terminal.
+extern "C" fn handle_signal(signal: libc::c_int) {
+    unsafe {
+        // Straight to the terminal: a signal handler cannot wait for a
+        // buffer, and the buffer is where the escape sequence would die.
+        libc::write(
+            1,
+            RESTORE_TERMINAL.as_ptr() as *const libc::c_void,
+            RESTORE_TERMINAL.len(),
+        );
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+}
+
 /// Run the terminal.
 fn interactive(
     hub: &channel::Hub,
@@ -259,6 +313,17 @@ fn interactive(
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
+    // The terminal has to be given back whatever happens. A terminal that is
+    // left in the alternate screen, with the mouse captured and the cursor
+    // hidden, is a terminal the user has to reset by hand - and a panic or a
+    // kill signal is exactly when they are least able to.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        previous_hook(info);
+    }));
+    install_signal_handlers();
+
     let outcome = event_loop(
         &mut terminal,
         hub,
@@ -269,13 +334,7 @@ fn interactive(
         sources,
     );
 
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    restore_terminal();
     outcome
 }
 
