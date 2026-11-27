@@ -1,0 +1,15 @@
+[package]
+name = "hermetic-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HERMETIC - the wire protocol between the terminal and the Heretic engine."
+
+[lib]
+name = "hermetic_protocol"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true

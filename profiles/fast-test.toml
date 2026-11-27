@@ -1,0 +1,37 @@
+# Smoke-test config for heretic on Apple Silicon (M4 Max).
+# Deliberately tiny: this exists to prove the pipeline works, not to produce
+# a good model. See config.default.toml in the upstream repo for the real knobs.
+
+dtypes = ["auto", "bfloat16", "float32"]
+quantization = "none"
+device_map = "auto"
+offload_outputs_to_cpu = true
+
+batch_size = 4
+max_batch_size = 8
+max_response_length = 64
+
+n_trials = 2
+n_startup_trials = 1
+study_checkpoint_dir = "checkpoints"
+modified_model_type = "decensored"
+max_shard_size = "5GB"
+
+# Refusal-rate scorer only. KL divergence needs the pre-modification model
+# kept resident and doubles the cost -- too slow for a smoke test.
+scorers = [
+  { plugin = "heretic.scorers.keyword_rate.KeywordRate", optimization = "minimize" },
+]
+
+modifiers = [
+  { plugin = "heretic.modifiers.ara.ARA" },
+]
+
+[modifier.ARA]
+preserve_row_magnitudes = true
+lora_rank = 8
+n_optimization_steps = 2
+learning_rate = 1.0
+max_iter = 10
+history_size = 10
+print_loss = true

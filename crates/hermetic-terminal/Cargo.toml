@@ -1,0 +1,34 @@
+[package]
+name = "hermetic-terminal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HERMETIC - a terminal that talks to every model runtime."
+
+[lib]
+name = "hermetic_terminal"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hermetic"
+path = "src/main.rs"
+
+[[bin]]
+name = "hermetic-shim"
+path = "src/bin/hermetic-shim.rs"
+
+[dependencies]
+hermetic-core = { path = "../hermetic-core" }
+hermetic-protocol = { path = "../hermetic-protocol" }
+anyhow.workspace = true
+serde_json.workspace = true
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+ratatui = "0.28"
+vt100 = "0.15"
+portable-pty = "0.8"
+libc = "0.2"
+
+[dev-dependencies]
+portable-pty = "0.8"

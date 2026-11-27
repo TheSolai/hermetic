@@ -1,0 +1,19 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# The engine's virtualenv: it is built by install.sh, not shipped.
+engine/.venv/
+**/__pycache__/
+*.pyc
+
+# Build jobs and study checkpoints
+jobs/
+study/
+checkpoints/
+
+# App bundles and icons
+/dist/
+
+# macOS
+.DS_Store

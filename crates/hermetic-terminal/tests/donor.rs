@@ -1,0 +1,55 @@
+//! The donor search, against the real hub.
+//!
+//! These tests talk to Hugging Face and to Ollama, so they are ignored by
+//! default. Run them with:
+//!
+//! ```text
+//! cargo test --release --test donor -- --ignored --nocapture
+//! ```
+//!
+//! What they check is the thing that actually breaks in the field: a model
+//! whose *name* does not describe its weights. `deepseek-r1:8b` is a
+//! `Qwen3-8B`, and `Qwen:latest` is a `Qwen2.5` of some size. The search has
+//! to reach the original weights from that.
+
+use hermetic_terminal::spec::{hint_of, shape_of, source_of};
+
+/// Find the repository whose weights have the same shape as `model`.
+fn donor_for(model: &str) -> Option<String> {
+    let source = source_of(model).expect("a source");
+    let signature = shape_of(&source).expect("a shape");
+    let hint = hint_of(&source, &signature);
+    let donor = hermetic_core::hub::find_donor(&signature, model, &hint);
+    if donor.repo.is_none() && !donor.gated.is_empty() {
+        println!("  gated instead: {:?}", donor.gated);
+    }
+    donor.repo
+}
+
+#[test]
+#[ignore = "talks to the hub and to Ollama"]
+fn a_renamed_model_finds_its_original_weights() {
+    // `deepseek-r1:8b` is a `Qwen3-8B`.
+    let repo = donor_for("deepseek-r1:latest").expect("a donor for deepseek-r1");
+    println!("deepseek-r1:latest -> {repo}");
+    assert!(
+        repo.starts_with("Qwen/") || repo.contains("Qwen3"),
+        "unexpected donor: {repo}"
+    );
+}
+
+#[test]
+#[ignore = "talks to the hub and to Ollama"]
+fn a_model_whose_name_says_nothing_still_finds_its_weights() {
+    // `Qwen:latest` says nothing at all: not a family, not a size.
+    let repo = donor_for("Qwen:latest").expect("a donor for Qwen:latest");
+    println!("Qwen:latest -> {repo}");
+}
+
+#[test]
+#[ignore = "talks to the hub and to Ollama"]
+fn a_qwen_family_model_finds_its_weights() {
+    let repo = donor_for("qwen2.5-coder:7b").expect("a donor for qwen2.5-coder:7b");
+    println!("qwen2.5-coder:7b -> {repo}");
+    assert!(repo.contains("Qwen2.5"), "unexpected donor: {repo}");
+}

@@ -1,0 +1,17 @@
+[package]
+name = "hermetic-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HERMETIC - one interface to every model runtime."
+
+[lib]
+name = "hermetic_core"
+path = "src/lib.rs"
+
+[dependencies]
+hermetic-protocol = { path = "../hermetic-protocol" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+libc = "0.2"
