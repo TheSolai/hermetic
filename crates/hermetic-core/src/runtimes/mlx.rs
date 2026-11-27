@@ -9,7 +9,7 @@
 //! with `mlx_lm.server`, which speaks the OpenAI chat API, so the terminal's
 //! one chat client works with it unchanged.
 
-use std::io::{BufRead, BufReader};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};

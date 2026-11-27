@@ -154,6 +154,8 @@ fn main() -> Result<()> {
 
     let run_dir = registry.root.join("run");
     std::fs::create_dir_all(&run_dir).context("create the run directory")?;
+    // Terminals that are no longer running left their directories behind.
+    shell::prune(&run_dir);
 
     let shim = shim_path();
     if !shim.exists() {
@@ -219,6 +221,8 @@ fn main() -> Result<()> {
         // behind: a socket that nothing is listening on, and a shell that
         // will outlive this process.
         first.shell.stop();
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir_all(&zdotdir);
         return Ok(());
     }
 
@@ -318,8 +322,11 @@ fn interactive(
     // hidden, is a terminal the user has to reset by hand - and a panic or a
     // kill signal is exactly when they are least able to.
     let previous_hook = std::panic::take_hook();
+    let panic_zdotdir = session.zdotdir.clone();
     std::panic::set_hook(Box::new(move |info| {
         restore_terminal();
+        // A terminal that died must not leave its directory behind either.
+        let _ = std::fs::remove_dir_all(&panic_zdotdir);
         previous_hook(info);
     }));
     install_signal_handlers();

@@ -239,3 +239,61 @@ source "{rc}"
     std::fs::write(dir.join(".zshenv"), "")?;
     Ok(dir)
 }
+
+/// Remove this terminal's directory, and the ones of terminals that are gone.
+///
+/// Every terminal makes a directory of its own, named after its process, so
+/// that two terminals never share one. A terminal that is killed leaves its
+/// directory behind, and they pile up: sixty of them is three megabytes of
+/// nothing. The directory of a process that is no longer running is dead
+/// weight, so it goes.
+///
+/// A directory that is less than ten minutes old is left alone even if the
+/// process is gone: the number may simply have been given to another process
+/// in the meantime, and that process's terminal must keep its directory.
+pub fn cleanup(base: &Path) {
+    let _ = std::fs::remove_dir_all(base.join(format!("zdot-{}", std::process::id())));
+    prune(base);
+}
+
+/// Remove the directories of terminals that are no longer running.
+pub fn prune(base: &Path) {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(pid) = name
+            .strip_prefix("zdot-")
+            .and_then(|rest| rest.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() as i32 || is_running(pid) {
+            continue;
+        }
+        // Too young to be sure: the number may have been given to another
+        // process in the meantime.
+        let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        let age = now.duration_since(modified).unwrap_or_default();
+        if age < std::time::Duration::from_secs(600) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
+}
+
+/// Is there still a process with this number?
+fn is_running(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // Signal 0 does not signal anything: it only asks whether the process
+    // could be signalled. A process that exists but belongs to somebody else
+    // answers with a permission error, which still means it exists.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}

@@ -104,6 +104,34 @@ When Ollama stores a model as safetensors and no GGUF of that shape is
 cached, the terminal says so rather than pretending: llama.cpp cannot read
 safetensors.
 
+## Which trial is kept
+
+Heretic optimises an ablation: it tries a number of ways to remove a model's
+refusals, scores each one, and keeps the best. "Best" is not obvious.
+
+Upstream sorts its Pareto front by the scorers one after another, so the trial
+that refuses **not at all** comes first - whatever it has cost the model. On
+gemma-2-2b that is the difference between a KL divergence of 0.08 and one of
+8.79, and the second one does not speak any more: it answers in gibberish. The
+scorers rate a destroyed model as Pareto-optimal, because it really does
+refuse the least.
+
+So the bridge does not take upstream's first trial. It takes the trial with the
+**lowest total score** - the sum of the scorers, all of which are minimised.
+That is the one that refuses less *and* keeps the model closest to what it
+was. The same choice is made for the default answer, so it holds whether the
+client picks a choice or the engine has to fall back to one.
+
+Two things make this stick:
+
+* The bridge asks upstream's own question ("Which trial do you want to use?")
+  and answers it itself. Upstream's control flow is not forked.
+* A study remembers the settings of the run that created it, and restores them
+  when it is resumed - including `trial_index`, the trial to keep. A study
+  created by a run with the trial pinned therefore pins it for good, and the
+  question is never asked again. The bridge drops that pin when a study is
+  resumed: the pin belongs to the run that asked for it, not to the study.
+
 ## Tabs
 
 Every tab is a shell in a pseudo-terminal and, once a model is loaded in it,
