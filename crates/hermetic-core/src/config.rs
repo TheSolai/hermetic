@@ -28,10 +28,17 @@ impl Config {
 
     /// The Heretic profile to use for builds.
     pub fn profile(&self) -> PathBuf {
+        // A profile can be chosen by name, so a build can be made faster (or
+        // better) without changing the code.
+        if let Ok(name) = std::env::var("HERMETIC_PROFILE") {
+            if let Some(root) = self.engine_dir.parent() {
+                return root.join("profiles").join(name);
+            }
+        }
         self.engine_dir
             .parent()
-            .map(|p| p.join("profiles/fast-test.toml"))
-            .unwrap_or_else(|| PathBuf::from("profiles/fast-test.toml"))
+            .map(|p| p.join("profiles/standard.toml"))
+            .unwrap_or_else(|| PathBuf::from("profiles/standard.toml"))
     }
 
     /// Read the configuration.

@@ -241,7 +241,6 @@ fn ollama_shape(name: &str) -> Option<Signature> {
 /// architecture, the exact parameter count, and the family the model came
 /// from.
 pub fn ollama_info(name: &str) -> Option<serde_json::Value> {
-    let (host, port) = hermetic_core::runtimes::ollama::ollama_addr();
     ollama_show(name)
         .and_then(|answer| {
             answer

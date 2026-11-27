@@ -297,6 +297,9 @@ fn build(
     base: Option<PathBuf>,
 ) -> Result<(Option<PathBuf>, Option<PathBuf>, bool)> {
     let hint = spec::hint_of(source, signature);
+    println!("  looking   for the original weights of this shape");
+    println!("            the hub is asked for every model with the same shape, and");
+    println!("            each one is checked. This takes a minute on a cold search.");
     let donor = hub::find_donor(signature, spec_arg, &hint);
     let Some(repo) = donor.repo.clone() else {
         let mut message = format!(
@@ -314,49 +317,79 @@ fn build(
         anyhow::bail!(message);
     };
 
-    println!("  building  an adapter for {repo}");
-    println!("            this downloads the original weights and runs Heretic over every");
-    println!("            layer of them - for a large model that is many hours and tens");
-    println!("            of gigabytes. Ctrl-C stops it; the panel shows the progress");
+    // The repositories with the right shape, best first. A donor can fail -
+    // the weights might be in a form Heretic cannot read - and then the next
+    // one is tried.
+    let mut donors = vec![repo.clone()];
+    donors.extend(donor.alternatives.clone());
 
     let config = hermetic_core::config::Config::load();
     let socket = std::env::var_os(SOCKET_ENV).map(PathBuf::from);
 
-    match base {
-        Some(base) => {
-            let built = registry.build(
-                signature,
-                &repo,
-                &format!("adapter for {repo}"),
-                &config.python,
-                &config.bridge_dir(),
-                &config.llama_cpp_dir,
-                socket.as_deref(),
-                1,
-            )?;
-            println!("  adapter   {}", built.display());
-            Ok((Some(base), Some(built), false))
+    let mut last: Option<anyhow::Error> = None;
+    for repo in donors {
+        println!("  building  an adapter for {repo}");
+        println!("            this downloads the original weights and runs Heretic over every");
+        println!("            layer of them - for a large model that is many hours and tens");
+        println!("            of gigabytes. Ctrl-C stops it; the panel shows the progress");
+
+        let attempt = match base.clone() {
+            Some(base) => registry
+                .build(
+                    signature,
+                    &repo,
+                    &format!("adapter for {repo}"),
+                    &config.python,
+                    &config.bridge_dir(),
+                    &config.llama_cpp_dir,
+                    socket.as_deref(),
+                    1,
+                )
+                .map(|built| (Some(base), Some(built), false)),
+            // There is no GGUF of this shape, so the merged build is the
+            // model: the donor's weights with the adapter folded in. That is
+            // a GGUF, and it can be served.
+            None => registry
+                .build_merged(
+                    signature,
+                    &repo,
+                    &format!("merged build of {repo}"),
+                    &config.python,
+                    &config.bridge_dir(),
+                    &config.llama_cpp_dir,
+                    socket.as_deref(),
+                    1,
+                )
+                .map(|merged| (Some(merged), None, true)),
+        };
+
+        match attempt {
+            Ok((weights, adapter, merged)) => {
+                if let Some(adapter) = &adapter {
+                    println!("  adapter   {}", adapter.display());
+                }
+                if merged {
+                    println!(
+                        "  weights   {} (the adapter is folded in)",
+                        weights
+                            .as_ref()
+                            .map(|w| w.display().to_string())
+                            .unwrap_or_default()
+                    );
+                }
+                return Ok((weights, adapter, merged));
+            }
+            Err(error) => {
+                println!("  that repository could not be read: {error}");
+                println!("            trying the next one with the same shape");
+                last = Some(error);
+            }
         }
-        // There is no GGUF of this shape, so the merged build is the model:
-        // the donor's weights with the adapter folded in. That is a GGUF, and
-        // it can be served.
-        None => {
-            let merged = registry.build_merged(
-                signature,
-                &repo,
-                &format!("merged build of {repo}"),
-                &config.python,
-                &config.bridge_dir(),
-                &config.llama_cpp_dir,
-                socket.as_deref(),
-                1,
-            )?;
-            println!(
-                "  weights   {} (the adapter is folded in)",
-                merged.display()
-            );
-            Ok((Some(merged), None, true))
-        }
+    }
+
+    match last {
+        Some(error) => Err(error),
+        None => anyhow::bail!("no donor with the shape {} could be built", signature.key()),
     }
 }
 

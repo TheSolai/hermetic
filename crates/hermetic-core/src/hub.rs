@@ -121,6 +121,7 @@ pub fn repo_info(repo: &str) -> Option<RepoInfo> {
 }
 
 /// What came back when a repo was asked for its shape.
+#[derive(Debug, Clone)]
 enum Shape {
     /// The shape, read from the repo's config.
     Known(Signature),
@@ -286,6 +287,18 @@ pub fn is_derivative(repo: &str) -> bool {
         "-fp8",
         "-tuned",
         "-reasoning",
+        // Weights that only another framework can read. Heretic loads the
+        // model with transformers, and an MLX conversion is not a set of
+        // tensors transformers can open.
+        "-mlx",
+        "mlx-",
+        "-4bit",
+        "-8bit",
+        "-int4",
+        "-nf4",
+        "-w4a16",
+        "-quantized",
+        "-quantised",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
@@ -316,6 +329,13 @@ pub struct Donor {
     pub repo: Option<String>,
     /// Repositories that look right but are gated: they need a token.
     pub gated: Vec<String>,
+    /// The other repositories with the same shape, in the order they were
+    /// found.
+    ///
+    /// A donor can fail: the weights might be in a form Heretic cannot read,
+    /// or the hub might be having a bad afternoon. The next one is then
+    /// tried, and the one after that.
+    pub alternatives: Vec<String>,
 }
 
 impl Donor {
@@ -382,7 +402,8 @@ fn arch_families(arch: &str) -> Vec<String> {
     let mut out = vec![word.clone()];
 
     // `qwen35` is `Qwen3.5`, and `qwen2` is `Qwen2.5`.
-    if let Some((letters, digits)) = base.split_once(|c: char| c.is_ascii_digit()) {
+    if let Some(index) = base.find(|c: char| c.is_ascii_digit()) {
+        let (letters, digits) = base.split_at(index);
         if digits.len() == 2 {
             let (major, minor) = digits.split_at(1);
             out.push(format!("{}{}.{}", capitalise(letters), major, minor));
@@ -643,6 +664,42 @@ fn repo_infos(repos: &[String]) -> Vec<(String, Option<RepoInfo>)> {
     out
 }
 
+/// Ask every candidate for its shape, in parallel, and in order.
+///
+/// The shape is the thing that decides, so every candidate has to be asked.
+/// One request at a time takes a minute for a big search, which is long
+/// enough to look like a hang.
+fn shapes_of(candidates: &[String], exists: &[String], target: &Signature) -> Vec<(String, Shape)> {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().min(4))
+        .unwrap_or(2)
+        .max(1);
+    let chunk = (candidates.len() + workers - 1) / workers;
+    let mut out: Vec<(String, Shape)> = Vec::new();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for part in candidates.chunks(chunk.max(1)) {
+            let exists: Vec<String> = exists.to_vec();
+            let target = target.clone();
+            handles.push(scope.spawn(move || {
+                part.iter()
+                    .map(|repo| {
+                        let known = exists.iter().any(|known| known == repo);
+                        (repo.clone(), repo_shape(repo, known))
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+        for handle in handles {
+            match handle.join() {
+                Ok(part) => out.extend(part),
+                Err(_) => {}
+            }
+        }
+    });
+    out
+}
+
 /// Find a repository whose weights have exactly the shape we need.
 ///
 /// The shape has to match to the digit: llama.cpp refuses an adapter whose
@@ -662,15 +719,23 @@ pub fn find_donor(target: &Signature, spec: &str, hint: &Hint) -> Donor {
     candidates.extend(found);
 
     let mut gated: Vec<String> = Vec::new();
-    for repo in candidates {
-        let known = exists.iter().any(|known| known == &repo);
-        match repo_shape(&repo, known) {
+    let mut found: Vec<String> = Vec::new();
+
+    // Every candidate is asked for its shape, and that is one request each.
+    // There are more candidates than there is patience, so they are asked in
+    // parallel - but the order is kept, so the best candidate is still the
+    // first one tried.
+    let shapes = shapes_of(&candidates, &exists, target);
+    for (repo, shape) in shapes {
+        match shape {
             Shape::Known(signature) => {
                 if signature.matches(target) {
-                    return Donor {
-                        repo: Some(repo),
-                        gated,
-                    };
+                    found.push(repo);
+                    // Five is enough: the first one that Heretic can read is
+                    // the one that gets used.
+                    if found.len() >= 5 {
+                        break;
+                    }
                 }
             }
             Shape::Gated => {
@@ -681,7 +746,15 @@ pub fn find_donor(target: &Signature, spec: &str, hint: &Hint) -> Donor {
             Shape::Missing => {}
         }
     }
-    Donor { repo: None, gated }
+    let (repo, alternatives) = match found.split_first() {
+        Some((first, rest)) => (Some(first.clone()), rest.to_vec()),
+        None => (None, Vec::new()),
+    };
+    Donor {
+        repo,
+        gated,
+        alternatives,
+    }
 }
 
 /// Split a model name from its tag: `qwen3:8b` is `qwen3` and `8b`.
