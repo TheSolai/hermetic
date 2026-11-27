@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HERMETIC — a terminal where every model you load is hereticed first</title>
+<meta name="description" content="Heretic removes a model's refusal behaviour by modifying its weights. HERMETIC puts that inside a shell, for any local runtime: Ollama, GGUF, MLX, anything speaking the OpenAI API.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="bar">
+  <div class="wrap bar-in">
+    <span class="mark">HERMETIC</span>
+    <nav>
+      <a href="#what">what</a>
+      <a href="#runtimes">runtimes</a>
+      <a href="#finding">finding weights</a>
+      <a href="#install">install</a>
+      <a class="btn" href="https://github.com/TheSolai/hermetic">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<section class="hero">
+  <div class="wrap">
+    <p class="kicker">heretic's weights-level refusal removal, bound into your shell</p>
+    <h1>A terminal where every model<br>you load is <em>hereticed</em> first.</h1>
+    <p class="lede">
+      <a href="https://github.com/p-e-w/heretic">Heretic</a> takes a model's refusal behaviour
+      out of its <strong>weights</strong> — no prompt tricks, no system-prompt scaffolding.
+      It works, but it is a one-shot program: you point it at a model, it ablates the
+      weights, and you are left holding a <code>.gguf</code> and a separate
+      <code>llama-server</code> command.
+    </p>
+    <p class="lede">
+      HERMETIC puts that inside a shell. Type a model name — or click one in the panel —
+      and it finds the original weights, runs Heretic over them if an adapter for that
+      shape does not exist yet, binds the adapter, and hands you a live model.
+    </p>
+    <div class="cta">
+      <a class="btn big" href="https://github.com/TheSolai/hermetic">Get it on GitHub</a>
+      <a class="btn ghost big" href="#install">Install in one command</a>
+    </div>
+    <pre class="cmd"><span class="p">$</span> git clone https://github.com/TheSolai/hermetic
+<span class="p">$</span> cd hermetic &amp;&amp; ./install.sh
+<span class="p">$</span> ollama run qwen2.5:0.5b
+
+  HERMETIC · resolving the model and binding its adapter
+  model     qwen2.5:0.5b
+  shape     qwen2 · 24 layers · hidden 896 · ffn 4864
+  adapter   ~/.hermetic/adapters/qwen2-24-896-4864.gguf (ready)
+  serving   http://127.0.0.1:50473/v1 (hereticed)</pre>
+  </div>
+</section>
+
+<section class="shots" id="what">
+  <div class="wrap">
+    <h2>It is a real terminal. The panel knows your models.</h2>
+    <p class="sub">
+      Every model it can find — Ollama's store, GGUF files on disk, MLX models, the hub —
+      listed with its size and its state. Click one and it opens in a tab.
+    </p>
+    <img src="img/panel.png" alt="The HERMETIC panel listing 90 models">
+    <img src="img/loaded.png" alt="A model loaded with its Heretic adapter bound">
+  </div>
+</section>
+
+<section class="band" id="runtimes">
+  <div class="wrap">
+    <h2>One terminal. Every runtime.</h2>
+    <p class="sub">
+      Two questions, and nothing runtime-specific: <em>where are the weights</em>, and
+      <em>what can serve them</em>.
+    </p>
+    <div class="cols">
+      <div class="card">
+        <h3>Where are the weights?</h3>
+        <table>
+          <tr><td><code>ollama</code></td><td>~/.ollama/models</td><td class="ok">weights can change</td></tr>
+          <tr><td><code>gguf</code></td><td>a file on disk</td><td class="ok">weights can change</td></tr>
+          <tr><td><code>mlx</code></td><td>a directory of safetensors</td><td class="ok">adapter folds in</td></tr>
+          <tr><td><code>hf</code></td><td>the hub</td><td class="ok">weights can change</td></tr>
+          <tr><td><code>openai</code></td><td>a server already running</td><td class="no">prompt policy only</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h3>How is it served?</h3>
+        <table>
+          <tr><td><code>llama.cpp</code></td><td>GGUF files</td><td class="ok">adapter bound at runtime</td></tr>
+          <tr><td><code>mlx</code></td><td>safetensors</td><td class="ok">folded into the weights</td></tr>
+          <tr><td><code>ollama</code></td><td>Ollama's store</td><td class="no">prompt policy instead</td></tr>
+          <tr><td><code>openai</code></td><td>any OpenAI-compatible server</td><td class="no">prompt policy instead</td></tr>
+        </table>
+      </div>
+    </div>
+    <p class="note">
+      Every runtime that can be talked to at all speaks
+      <code>POST /v1/chat/completions</code> with server-sent events. So the terminal has
+      <strong>one</strong> chat client and does not care what is behind the endpoint.
+      Where the weights cannot be modified, the terminal says so — it never fakes it.
+    </p>
+  </div>
+</section>
+
+<section class="band alt" id="finding">
+  <div class="wrap">
+    <h2>Finding the original weights, when the name lies.</h2>
+    <p class="sub">
+      A model's name is no use at all here. A distilled <code>deepseek-r1:8b</code> is really
+      a <code>Qwen3-8B</code>. Only the shape says so — architecture, layers, hidden size,
+      feed-forward size — and the shape has to match to the digit, because llama.cpp will
+      only bind an adapter whose tensors line up exactly.
+    </p>
+    <ol class="steps">
+      <li><strong>The name inside the weights.</strong> A GGUF file says what it is
+        (<code>general.name</code>). It is also often old: a file that calls itself
+        <code>Qwen2-beta-4B-Chat</code> is a <code>Qwen1.5-4B-Chat</code> today, and the
+        hub redirects the old name to the new one.</li>
+      <li><strong>The organisation × family × size matrix.</strong> <code>Qwen:latest</code>
+        is really <code>Qwen/Qwen2.5-3B</code>; llama.cpp only says the architecture is
+        <code>qwen2</code>, so the minor version is guessed and crossed with the
+        organisations that publish models of that family.</li>
+      <li><strong>The hub's search, filtered by parameter count.</strong> Ollama knows the
+        count exactly; the hub knows each repository's count. That leaves a handful of
+        candidates.</li>
+      <li><strong>The shape, checked to the digit.</strong> The shape is the only thing
+        that is actually right, so it is what decides.</li>
+    </ol>
+    <p class="note">
+      One adapter serves every checkpoint and every quantisation of that shape, so the
+      second time you load a model it is instant. Gated repositories are reported as
+      gated, using the hub's own <code>gated</code> field — a <code>401</code> on a
+      download means “gated” or “does not exist” and nothing else.
+    </p>
+  </div>
+</section>
+
+<section class="band numbers">
+  <div class="wrap">
+    <h2>It actually works.</h2>
+    <p class="sub">
+      The same weights, served twice: once plain, once with the Heretic adapter bound.
+      Heretic's own evaluation set (<code>mlabonne/harmful_behaviors</code>, first 100),
+      counted with Heretic's own refusal markers.
+    </p>
+    <div class="stats">
+      <div class="stat"><span class="n">48</span><span class="l">refusals, before</span></div>
+      <div class="arrow">→</div>
+      <div class="stat good"><span class="n">4</span><span class="l">refusals, after</span></div>
+      <div class="stat"><span class="n">90</span><span class="l">models in the panel</span></div>
+      <div class="stat"><span class="n">1</span><span class="l">adapter per shape, for good</span></div>
+    </div>
+    <p class="note">
+      Reproduce it yourself with <code>engine/bridge/scripts/ab_refusal_bench.py</code>:
+      two llama-servers, one set of weights, one with <code>--lora</code>.
+    </p>
+  </div>
+</section>
+
+<section class="band" id="install">
+  <div class="wrap narrow">
+    <h2>Install</h2>
+    <pre class="cmd"><span class="p">$</span> git clone https://github.com/TheSolai/hermetic
+<span class="p">$</span> cd hermetic
+<span class="p">$</span> ./install.sh</pre>
+    <p class="sub">
+      That is the whole thing. It checks what it needs, builds the engine's virtualenv
+      (the vendored Heretic), builds the two binaries, and installs
+      <code>~/Applications/HERMETIC.app</code> with a shortcut on your Desktop.
+    </p>
+    <p class="note">
+      macOS, <a href="https://rustup.rs">Rust</a>, and <code>llama-server</code> on the PATH.
+      <code>ollama</code> is optional, but that is where most models come from.
+      A Hugging Face token (<code>HF_TOKEN</code>) is optional too, and unlocks the gated
+      families.
+    </p>
+    <div class="cta">
+      <a class="btn big" href="https://github.com/TheSolai/hermetic">github.com/TheSolai/hermetic</a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p>
+      HERMETIC is AGPL-3.0-or-later, because the engine is. Upstream
+      <a href="https://github.com/p-e-w/heretic">Heretic</a> is vendored and run
+      <strong>unmodified</strong> — the bridge only uses its own extension points, and
+      every scorer, every modifier, every shipped profile keeps working.
+    </p>
+    <p class="small">
+      llama.cpp for serving · Hugging Face for the weights · Ollama for the store ·
+      <span class="mark">HERMETIC</span> for the terminal.
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>
