@@ -146,8 +146,9 @@ impl OllamaRuntime {
 
     /// Is Ollama running?
     pub fn is_running(&self) -> bool {
-        crate::http::post_json(&self.host, self.port, "/api/tags", &serde_json::json!({}))
-            .is_ok()
+        // `/api/tags` is a GET. Ollama answers a POST to it with `405`,
+        // which is not what "Ollama is not running" looks like.
+        crate::http::get_json(&self.host, self.port, "/api/tags").is_ok()
     }
 }
 

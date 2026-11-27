@@ -79,8 +79,24 @@ fn a_mixture_of_experts_finds_its_weights() {
 
 #[test]
 #[ignore = "talks to the hub and to Ollama"]
+fn a_model_that_ships_its_own_code_finds_the_repository_that_ships_it() {
+    // `clover:35b` is a hybrid model that is not in Transformers at all: the
+    // repository carries its own model code next to the weights. A conversion
+    // of it - an MLX one, a quantised one - cannot be read by the optimiser,
+    // so the donor has to be the repository itself.
+    let repo = donor_for("clover:35b").expect("a donor for clover:35b");
+    println!("clover:35b -> {repo}");
+    for forbidden in ["-mlx", "-4bit", "-8bit", "-int4", "-nf4", "-w4a16"] {
+        assert!(
+            !repo.contains(forbidden),
+            "a {forbidden} copy cannot be read by the optimiser: {repo}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "talks to the hub and to Ollama"]
 fn an_embedding_model_has_no_donor_and_says_so() {
-    // `nomic-embed-text` is not a chat model at all.
     let source = source_of("nomic-embed-text:latest").expect("a source");
     let signature = shape_of(&source).expect("a shape");
     let hint = hint_of(&source, &signature);

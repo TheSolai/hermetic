@@ -205,6 +205,24 @@ pub fn post_json(host: &str, port: u16, path: &str, body: &Value) -> Result<Valu
     })
 }
 
+/// Get a URL and read a JSON answer.
+///
+/// Some servers only answer `GET`: Ollama's `/api/tags` is one of them, and
+/// a `POST` to it is answered with `405`, which is how the runtime ended up
+/// thinking Ollama was never running.
+pub fn get_json(host: &str, port: u16, path: &str) -> Result<Value> {
+    let mut conn = Conn::connect(host, port, Duration::from_secs(30))?;
+    conn.request("GET", path, None)?;
+    let text = conn.body_text()?;
+    let start = text.find('{').unwrap_or(0);
+    serde_json::from_str(&text[start..]).with_context(|| {
+        format!(
+            "the answer from {host}:{port}{path} was not JSON: {}",
+            text.chars().take(200).collect::<String>()
+        )
+    })
+}
+
 /// A piece of the model's answer.
 #[derive(Debug, Clone, Copy)]
 pub enum Delta<'a> {

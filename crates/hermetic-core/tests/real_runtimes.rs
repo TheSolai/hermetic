@@ -57,18 +57,29 @@ fn a_model_with_its_adapter() -> Option<(PathBuf, PathBuf, Signature)> {
     None
 }
 
-/// An MLX model in the Hugging Face cache, if there is one.
-fn an_mlx_model() -> Option<PathBuf> {
+/// The MLX models in the Hugging Face cache.
+///
+/// Not just the first one: mlx-lm only knows the architectures it has been
+/// taught, and a cache collects models of every vintage. One that mlx-lm
+/// cannot read is not a failure of the runtime, so the test tries the next
+/// one rather than failing on a model that was never going to load.
+fn mlx_models() -> Vec<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
     let hub = PathBuf::from(home).join(".cache/huggingface/hub");
     let mut found: Vec<PathBuf> = Vec::new();
-    for entry in std::fs::read_dir(&hub).ok()?.flatten() {
+    let Ok(entries) = std::fs::read_dir(&hub) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         if !name.starts_with("models--mlx-community--") {
             continue;
         }
         let snapshots = entry.path().join("snapshots");
-        for snapshot in std::fs::read_dir(&snapshots).ok()?.flatten() {
+        let Ok(snapshot_entries) = std::fs::read_dir(&snapshots) else {
+                continue;
+            };
+            for snapshot in snapshot_entries.flatten() {
             let path = snapshot.path();
             if path.join("config.json").is_file()
                 && std::fs::read_dir(&path).ok().map(|d| d.flatten().any(|e| {
@@ -80,7 +91,7 @@ fn an_mlx_model() -> Option<PathBuf> {
         }
     }
     found.sort();
-    found.into_iter().next()
+    found
 }
 
 #[test]
@@ -208,31 +219,55 @@ fn llama_cpp_serves_a_model_without_an_adapter_too() {
 #[test]
 #[ignore = "needs mlx-lm and an MLX model"]
 fn mlx_serves_a_real_mlx_model() {
-    let Some(model) = an_mlx_model() else {
+    let models = mlx_models();
+    if models.is_empty() {
         eprintln!("no MLX model in the Hugging Face cache - skipping");
         return;
-    };
-    eprintln!("serving {}", model.display());
+    }
 
     let runtime = MlxRuntime::default();
     assert!(runtime.is_available(), "mlx-lm is installed");
 
-    let signature = hermetic_core::runtimes::mlx::mlx_signature(&model).expect("a shape");
-    let request = ServeRequest::new(
-        ModelSource::Mlx {
-            path: model,
-            repo: None,
-        },
-        signature,
+    let mut failures: Vec<String> = Vec::new();
+    for model in models {
+        eprintln!("serving {}", model.display());
+        let Some(signature) = hermetic_core::runtimes::mlx::mlx_signature(&model) else {
+            eprintln!("  no shape - skipping");
+            continue;
+        };
+        let request = ServeRequest::new(
+            ModelSource::Mlx {
+                path: model,
+                repo: None,
+            },
+            signature,
+        );
+
+        // A model mlx-lm does not know how to read is not a failure of the
+        // runtime, so the next one is tried.
+        let handle = match runtime.serve(&request) {
+            Ok(handle) => handle,
+            Err(error) => {
+                eprintln!("  mlx-lm could not serve it ({error}) - trying the next model");
+                failures.push(error.to_string());
+                continue;
+            }
+        };
+        let mut chat = Chat::new(&handle.endpoint, &handle.model).expect("a chat");
+        let answer = chat
+            .say("What is the capital of France? One word.")
+            .expect("an answer");
+        assert!(!answer.trim().is_empty(), "the model answered something");
+        eprintln!("answered: {}", answer.trim());
+
+        (handle.stop)();
+        return;
+    }
+
+    panic!(
+        "no MLX model could be served ({}): {failures:?}",
+        failures.len()
     );
-
-    let handle = runtime.serve(&request).expect("the model is served");
-    let mut chat = Chat::new(&handle.endpoint, &handle.model).expect("a chat");
-    let answer = chat.say("What is the capital of France? One word.").expect("an answer");
-    assert!(!answer.trim().is_empty(), "the model answered something");
-    eprintln!("answered: {}", answer.trim());
-
-    (handle.stop)();
 }
 
 #[test]
