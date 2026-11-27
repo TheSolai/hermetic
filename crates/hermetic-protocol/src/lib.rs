@@ -62,6 +62,13 @@ pub enum Event {
         matches: usize,
         /// How many answers there were.
         total: usize,
+        /// Which tab the model being probed is in.
+        ///
+        /// Without this the score cannot be put next to the right model: two
+        /// tabs can be running two models, and the number on the panel would
+        /// belong to whichever tab happened to be empty.
+        #[serde(default)]
+        tab: Option<u64>,
         /// One line about the result, with the score of the untouched model
         /// in it when there is one.
         #[serde(default)]
@@ -71,6 +78,12 @@ pub enum Event {
     Done { exit_code: i32 },
     /// The engine crashed.
     Error { error: String },
+    /// The engine's socket closed: it is gone.
+    ///
+    /// The engine does not send this - the channel does, when the socket
+    /// closes. Without it the terminal keeps a panel row for an engine that
+    /// finished minutes ago.
+    Gone {},
     /// An event this client does not know about. Forward compatible.
     #[serde(other)]
     Unknown,

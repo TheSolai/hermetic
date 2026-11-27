@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use crate::http::{self, Delta};
 
 /// A conversation with a model.
+#[derive(Debug, Clone)]
 pub struct Chat {
     /// The host the server is on.
     pub host: String,
@@ -39,6 +40,11 @@ impl Chat {
             history: Vec::new(),
             policy: None,
         })
+    }
+
+    /// Where this conversation is going.
+    pub fn base_url(&self) -> String {
+        format!("http://{}:{}/v1", self.host, self.port)
     }
 
     /// Use a prompt-level policy.
@@ -94,7 +100,18 @@ impl Chat {
             "/v1/chat/completions",
             &body,
             &mut on_delta,
-        )?;
+        );
+        let answer = match answer {
+            Ok(answer) => answer,
+            Err(error) => {
+                // The question that could not be asked is taken back out of
+                // the history. Left in, the next question is sent with the
+                // last one still in it, and the model answers the wrong
+                // thing.
+                self.history.pop();
+                return Err(error);
+            }
+        };
         if !answer.is_empty() {
             self.history.push(json!({"role": "assistant", "content": answer}));
         }

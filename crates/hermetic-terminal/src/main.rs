@@ -11,7 +11,7 @@
 //! and the log.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -167,14 +167,30 @@ fn main() -> Result<()> {
 
     // The socket the engines report to. It has to be short: a unix socket
     // path is limited to about a hundred characters.
-    let socket_path = PathBuf::from("/tmp").join(format!("hermetic-{}.sock", std::process::id()));
+    //
+    // It lives in this user's own temporary directory, not in /tmp. /tmp is
+    // world-writable, and a socket there can be connected to by anybody on
+    // the machine - who could then tell the terminal that a model is being
+    // served, and what it is.
+    let socket_path = socket_path();
     let hub = channel::Hub::bind(&socket_path).context("bind the event channel")?;
+    if let Ok(mut guard) = SIGNAL_SOCKET.lock() {
+        *guard = Some(socket_path.clone());
+    }
 
     let ollama_bin = hermetic_terminal::which("ollama").unwrap_or_else(|| PathBuf::from("ollama"));
     let llama_cli_bin =
         hermetic_terminal::which("llama-cli").unwrap_or_else(|| PathBuf::from("llama-cli"));
     let injection = shell::injection(&shim, &socket_path, &ollama_bin, &llama_cli_bin);
     let zdotdir = shell::zdotdir(&run_dir, &injection)?;
+
+    // The socket and the run directory go when the terminal goes, however it
+    // goes. A terminal that is killed with a signal has its own way of
+    // doing it; every other way is this.
+    let cleanup = Cleanup {
+        socket: socket_path.clone(),
+        zdotdir: zdotdir.clone(),
+    };
 
     let home = std::env::var("HOME")
         .map(PathBuf::from)
@@ -212,17 +228,15 @@ fn main() -> Result<()> {
     let first = session.new_tab(shell_rows, shell_cols)?;
 
     if cli.check {
-        println!("shell:    {}", session.shell_program);
-        println!("shim:     {}", session.shim.display());
-        println!("engine:   {}", session.engine_dir.display());
-        println!("registry: {}", session.registry_root.display());
-        println!("channel:  {}", session.socket.display());
+        let ok = self_check(&session, &socket_path);
         // The check has said what it came to say. It must leave nothing
         // behind: a socket that nothing is listening on, and a shell that
         // will outlive this process.
         first.shell.stop();
-        let _ = std::fs::remove_file(&socket_path);
-        let _ = std::fs::remove_dir_all(&zdotdir);
+        drop(cleanup);
+        if !ok {
+            std::process::exit(1);
+        }
         return Ok(());
     }
 
@@ -243,9 +257,117 @@ fn main() -> Result<()> {
         &sources,
     );
 
-    let _ = std::fs::remove_file(&socket_path);
-    let _ = std::fs::remove_dir_all(&zdotdir);
+    drop(cleanup);
     result
+}
+
+/// Check that everything HERMETIC needs is where it should be.
+///
+/// This is a check, not a printout of the paths: it says what is missing
+/// and what to do about it, and it exits with a failure when something the
+/// terminal cannot work without is not there.
+fn self_check(session: &Session, socket: &Path) -> bool {
+    let mut ok = true;
+
+    // The shell.
+    let shell_ok = Path::new(&session.shell_program).exists()
+        || hermetic_terminal::which(&session.shell_program).is_some();
+    println!(
+        "{}  shell    {}",
+        if shell_ok { "✓" } else { "✗" },
+        session.shell_program
+    );
+    if !shell_ok {
+        println!("            this shell is not on the PATH - HERMETIC needs one to run");
+        ok = false;
+    }
+
+    // The interceptor.
+    let shim_ok = session.shim.exists();
+    println!(
+        "{}  shim     {}",
+        if shim_ok { "✓" } else { "✗" },
+        session.shim.display()
+    );
+    if !shim_ok {
+        println!("            the interceptor is missing - build the workspace first");
+        ok = false;
+    }
+
+    // The engine: its python and its tools.
+    let python = session.engine_dir.join(".venv/bin/python");
+    let python_ok = python.exists();
+    println!(
+        "{}  engine   {}",
+        if python_ok { "✓" } else { "✗" },
+        session.engine_dir.display()
+    );
+    if !python_ok {
+        println!("            the engine's python is missing at {}", python.display());
+        println!("            run scripts/build_app.sh to put the engine in place");
+        ok = false;
+    }
+
+    let llama_cpp = session.engine_dir.join("llamacpp");
+    let llama_ok = llama_cpp.join("convert_lora_to_gguf.py").exists();
+    println!(
+        "{}  converter{}",
+        if llama_ok { "✓" } else { "✗" },
+        llama_cpp.display()
+    );
+    if !llama_ok {
+        println!("            the adapter converter is missing - the adapter cannot be made");
+        ok = false;
+    }
+
+    // The registry, and what is in it.
+    let registry_ok = session.registry_root.is_dir();
+    println!(
+        "{}  registry {}",
+        if registry_ok { "✓" } else { "✗" },
+        session.registry_root.display()
+    );
+    let registry = hermetic_core::Registry::new();
+    let adapters = std::fs::read_dir(registry.adapters_dir())
+        .map(|entries| entries.flatten().count())
+        .unwrap_or(0);
+    println!("✓  adapters {adapters} built");
+
+    // The channel.
+    let socket_ok = socket.exists();
+    println!(
+        "{}  channel  {}",
+        if socket_ok { "✓" } else { "✗" },
+        socket.display()
+    );
+
+    // The models that can be found.
+    let sources = catalogue::sources(&[], &[], &[]);
+    let found = catalogue::catalogue(&sources, &registry).len();
+    println!("✓  models   {found} found on this machine");
+
+    ok
+}
+
+/// The socket this terminal listens on.
+///
+/// One per terminal: two live terminals never share a socket, so what one
+/// says can never be taken for what the other says.
+fn socket_path() -> PathBuf {
+    let mut dir = std::env::temp_dir();
+    // The temporary directory is per-user on macOS and is not world
+    // writable, which is what keeps the socket private.
+    dir.push(format!("hermetic-{}", std::process::id()));
+    dir.push("channel.sock");
+    if dir.as_os_str().len() < 90 {
+        return dir;
+    }
+    // A unix socket path is limited to about a hundred characters. When the
+    // temporary directory is a long one, a short name in it is used
+    // instead - and it is made private, so it is no worse.
+    let mut short = std::env::temp_dir();
+    short.push(format!("h{}.sock", std::process::id()));
+    short
 }
 
 /// The bytes that give the terminal back.
@@ -286,6 +408,12 @@ fn install_signal_handlers() {
     }
 }
 
+/// The socket the terminal is listening on, for the signal handler.
+///
+/// A signal handler cannot wait for a lock, so the path is kept here in
+/// plain memory and read from there.
+static SIGNAL_SOCKET: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
 /// What a signal does to the terminal.
 extern "C" fn handle_signal(signal: libc::c_int) {
     unsafe {
@@ -296,8 +424,38 @@ extern "C" fn handle_signal(signal: libc::c_int) {
             RESTORE_TERMINAL.as_ptr() as *const libc::c_void,
             RESTORE_TERMINAL.len(),
         );
+        // The socket is removed too. Without this, a terminal that was
+        // killed leaves a socket behind, and the next one to use that name
+        // would be talking to a terminal that is not there.
+        if let Ok(guard) = SIGNAL_SOCKET.try_lock() {
+            if let Some(path) = guard.as_ref() {
+                let text = path.as_os_str().as_encoded_bytes();
+                libc::unlink(text.as_ptr() as *const libc::c_char);
+            }
+        }
         libc::signal(signal, libc::SIG_DFL);
         libc::raise(signal);
+    }
+}
+
+/// What the terminal leaves behind when it goes.
+///
+/// The socket and the run directory are removed however the terminal ends:
+/// on the way out, on an error, or through a panic. A terminal that leaves
+/// them behind fills the temporary directory with sockets nothing is
+/// listening on.
+struct Cleanup {
+    socket: PathBuf,
+    zdotdir: PathBuf,
+}
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.socket);
+        if let Some(parent) = self.socket.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+        let _ = std::fs::remove_dir_all(&self.zdotdir);
     }
 }
 
@@ -383,6 +541,15 @@ fn event_loop(
             app.set_catalogue(entries);
         }
 
+        // A build has finished: the machine has changed, so the list of
+        // models is looked for again. Without this the panel goes on
+        // saying "build" for a model that has an adapter now - and the
+        // user may build it a second time, which is hours of the GPU.
+        if app.catalogue_stale {
+            app.catalogue_stale = false;
+            refresh_catalogue(&mut app);
+        }
+
         // What the engines said.
         while let Ok((id, event)) = hub.events.try_recv() {
             app.on_event(id, event);
@@ -390,8 +557,26 @@ fn event_loop(
 
         // Answer a question, if one is waiting.
         if let Some((id, answer)) = app.take_answer() {
-            let _ = hub.send_answer(id, &answer);
-            app.status = "answered the engine".into();
+            match hub.send_answer(id, &answer) {
+                Ok(()) => app.status = "answered the engine".into(),
+                Err(error) => {
+                    // Saying it worked when it did not is worse than saying
+                    // nothing at all.
+                    app.status = format!("the engine did not take the answer: {error}");
+                    app.push_log(format!("the answer was not delivered: {error}"));
+                }
+            }
+        }
+
+        // A shell that has ended. The pane keeps the last thing it drew,
+        // which looks exactly like a terminal that has frozen.
+        for index in 0..app.tabs.len() {
+            let ended = app.tabs[index].shell.exited();
+            if ended {
+                let title = app.tabs[index].title.clone();
+                app.status = format!("{title} has ended");
+                app.push_log(format!("{title} has ended - press Ctrl-T for a new tab"));
+            }
         }
 
         // What every shell wrote. A background tab keeps its screen up to
@@ -509,12 +694,18 @@ fn handle_key(
     // Alt-1 .. Alt-9 jump to a tab.
     if key.modifiers.contains(KeyModifiers::ALT) {
         if let KeyCode::Char(c) = key.code {
-            if let Some(index) = c.to_digit(10) {
-                let index = index as usize - 1;
-                if index < app.tabs.len() {
-                    app.active = index;
+            match c {
+                '0' => {}
+                c => {
+                    if let Some(index) = c.to_digit(10) {
+                        // Alt-1 .. Alt-9 jump to a tab. Alt-0 is not a tab:
+                        // subtracting one from zero would wrap around.
+                        let index = index as usize - 1;
+                        if index < app.tabs.len() {
+                            app.active = index;
+                        }
+                    }
                 }
-                return Ok(());
             }
             match c {
                 // Alt-M drives the model list with the keyboard.
@@ -561,7 +752,9 @@ fn handle_key(
                 if let Some(model) = app.selected_model().map(|e| e.spec()) {
                     match open_model_in_new_tab(app, session, terminal, &model) {
                         Ok(()) => app.status = format!("{model} is loading in a new tab"),
-                        Err(error) => app.status = format!("could not open {model}: {error}"),
+                        Err(error) => app.status = format!(
+                            "could not open {model}: {error} — the tab is there, type the name again"
+                        ),
                     }
                 }
                 return Ok(());
@@ -685,12 +878,16 @@ fn handle_click(
         if modifiers.contains(KeyModifiers::ALT) {
             match open_model_in_new_window(&spec) {
                 Ok(()) => app.status = format!("opened {name} in a new window"),
-                Err(error) => app.status = format!("could not open {name}: {error}"),
+                Err(error) => app.status = format!(
+                    "could not open {name}: {error} — the tab is there, type the name again"
+                ),
             }
         } else {
             match open_model_in_new_tab(app, session, terminal, &spec) {
                 Ok(()) => app.status = format!("{name} is loading in a new tab"),
-                Err(error) => app.status = format!("could not open {name}: {error}"),
+                Err(error) => app.status = format!(
+                    "could not open {name}: {error} — the tab is there, type the name again"
+                ),
             }
         }
         return Ok(());

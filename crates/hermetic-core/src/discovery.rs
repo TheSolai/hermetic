@@ -48,7 +48,14 @@ pub fn discover(sources: &Sources, registry: &Registry) -> Vec<ModelDescriptor> 
     let mut out: Vec<ModelDescriptor> = Vec::new();
 
     if let Some(root) = &sources.ollama {
-        for descriptor in ollama_models(root) {
+        for mut descriptor in ollama_models(root) {
+            // An Ollama model is served from the registry like any other
+            // one, so it has an adapter state too. Without this the panel
+            // said "unknown" for every model in Ollama's store, while the
+            // models lying on disk said "ready".
+            if let Some(signature) = &descriptor.signature {
+                descriptor.adapter = adapter_state(registry, signature);
+            }
             out.push(descriptor);
         }
     }
@@ -218,15 +225,37 @@ pub fn is_gguf_file(path: &Path) -> bool {
 // ── GGUF ───────────────────────────────────────────────────────────────────
 
 /// Every GGUF file in a folder, and in the folders under it.
+///
+/// The walk has a depth limit and does not follow symbolic links. A link
+/// that points at a parent directory would otherwise make this walk for
+/// ever, and a folder of links is a normal thing to have.
 pub fn gguf_models(directory: &Path, registry: &Registry) -> Vec<ModelDescriptor> {
+    gguf_models_at(directory, registry, 0)
+}
+
+/// How deep the walk goes.
+const MAX_DEPTH: usize = 8;
+
+fn gguf_models_at(directory: &Path, registry: &Registry, depth: usize) -> Vec<ModelDescriptor> {
     let mut out = Vec::new();
+    if depth > MAX_DEPTH {
+        return out;
+    }
     let Ok(entries) = std::fs::read_dir(directory) else {
         return out;
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        // A link is followed for the file itself - a link to a GGUF is a
+        // GGUF - but not for a directory, which can point back up.
+        let is_link = std::fs::symlink_metadata(&path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
         if path.is_dir() {
-            out.extend(gguf_models(&path, registry));
+            if is_link {
+                continue;
+            }
+            out.extend(gguf_models_at(&path, registry, depth + 1));
             continue;
         }
         if path.extension().and_then(|e| e.to_str()) != Some("gguf") {

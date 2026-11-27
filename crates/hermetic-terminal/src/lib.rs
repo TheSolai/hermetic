@@ -69,3 +69,45 @@ pub fn which(name: &str) -> Option<std::path::PathBuf> {
     }
     None
 }
+
+/// Take the control characters out of a string that is about to be drawn.
+///
+/// A model's name can come from a file name on disk, and macOS only forbids
+/// `/` and NUL in those - so an escape sequence or a newline can be in one.
+/// Drawn as they are, the terminal would *run* them: the screen would be
+/// changed by a name, and a newline in a name would move every row below it,
+/// so a click would land on the wrong model.
+///
+/// Control characters are replaced by a space, and the result is trimmed.
+pub fn clean(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control() {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    out.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_escape_sequence_in_a_name_is_defused() {
+        let name = "evil\u{1b}[2Jmodel";
+        assert_eq!(clean(name), "evil [2Jmodel");
+    }
+
+    #[test]
+    fn a_newline_in_a_name_does_not_move_the_rows() {
+        assert_eq!(clean("one\ntwo"), "one two");
+    }
+
+    #[test]
+    fn an_ordinary_name_is_left_alone() {
+        assert_eq!(clean("qwen3:0.6b"), "qwen3:0.6b");
+    }
+}

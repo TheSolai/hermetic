@@ -82,6 +82,14 @@ impl Config {
             }
         }
 
+        // An engine directory next to the binary. The app bundle keeps it
+        // there, and this is what makes the bundle work without a
+        // configuration file - and without falling back to the machine the
+        // binary was built on, which is a different machine entirely.
+        if let Some(engine_dir) = engine_dir_beside_the_binary() {
+            return Config::from_engine(engine_dir);
+        }
+
         Config::from_engine(repo_root().join("engine"))
     }
 
@@ -98,12 +106,43 @@ impl Config {
 }
 
 /// The repository this was built in.
+///
+/// This is a path that was written when the binary was compiled, so it is
+/// the path on the machine that built it. It is the last resort, not the
+/// first: a binary that has been copied somewhere else must not look for
+/// its engine on somebody else's disk.
 pub fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The engine directory that is next to the running binary.
+///
+/// The app bundle keeps the engine in `Contents/Resources/engine`, and the
+/// ordinary build keeps it in `target/release/engine`. Both are found from
+/// where the binary is, so a copied binary still finds its own engine.
+fn engine_dir_beside_the_binary() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let candidates = [
+        Some(dir.join("engine")),
+        // Inside an app bundle: Contents/MacOS/../Resources/engine
+        dir.parent()
+            .map(|p| p.join("Resources").join("engine")),
+        // The build directory: target/release/../engine
+        dir.parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("engine")),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        if candidate.join(".venv").is_dir() || candidate.join("heretic").is_dir() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn config_file_candidates() -> Vec<PathBuf> {

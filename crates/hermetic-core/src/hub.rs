@@ -61,17 +61,6 @@ fn curl_args() -> Vec<String> {
     args
 }
 
-/// Fetch a URL and parse it as JSON.
-fn get_json(url: &str) -> Option<Value> {
-    let mut command = Command::new("curl");
-    for argument in curl_args() {
-        command.arg(argument);
-    }
-    let out = command.arg(url).output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    serde_json::from_str(&text).ok()
-}
-
 /// Fetch a URL and read its body and its status code.
 fn get_with_status(url: &str) -> Option<(String, String)> {
     let mut command = Command::new("curl");
@@ -94,6 +83,11 @@ pub struct RepoInfo {
     pub gated: bool,
     /// How many parameters the model has, when the hub knows.
     pub parameters: Option<u64>,
+    /// Did the hub say it was busy?
+    ///
+    /// A rate-limited hub has not said the repository is not there. It has
+    /// said nothing, which is not the same thing.
+    pub busy: bool,
 }
 
 /// Ask the hub about a repository.
@@ -103,8 +97,21 @@ pub struct RepoInfo {
 /// repository from one that simply does not exist. The status code of a
 /// download tells the two apart too easily to get wrong: the hub answers
 /// `401` for a repository that was never there.
+///
+/// The status is kept, because it is the only way to tell a rate-limited
+/// hub from a repository that is not there. A busy hub that reads as "no
+/// model found" is a lie the user would act on.
 pub fn repo_info(repo: &str) -> Option<RepoInfo> {
-    let value = get_json(&format!("https://huggingface.co/api/models/{repo}"))?;
+    let (body, code) = get_with_status(&format!("https://huggingface.co/api/models/{repo}"))?;
+    if code == "429" {
+        // The hub is busy. It has not said the repository is not there.
+        return Some(RepoInfo {
+            gated: false,
+            parameters: None,
+            busy: true,
+        });
+    }
+    let value: Value = serde_json::from_str(&body).ok()?;
     if value.get("error").is_some() {
         return None;
     }
@@ -117,7 +124,11 @@ pub fn repo_info(repo: &str) -> Option<RepoInfo> {
         .get("safetensors")
         .and_then(|s| s.get("total"))
         .and_then(|v| v.as_u64());
-    Some(RepoInfo { gated, parameters })
+    Some(RepoInfo {
+        gated,
+        parameters,
+        busy: false,
+    })
 }
 
 /// What came back when a repo was asked for its shape.
@@ -533,6 +544,38 @@ const ROLE_WORDS: &[&str] = &[
     "hf",
 ];
 
+/// The role words that mean the same thing.
+///
+/// `Qwen2.5-0.5B-it` and `Qwen2.5-0.5B-Instruct` are the same model, written
+/// two ways. Comparing them as different would send the terminal off to
+/// build the same adapter again and again.
+const ROLE_ALIASES: &[(&str, &[&str])] = &[
+    ("it", &["instruct", "chat", "it"]),
+    ("instruct", &["instruct", "chat", "it"]),
+    ("chat", &["instruct", "chat", "it"]),
+    ("base", &["base"]),
+    ("coder", &["coder"]),
+    ("reasoning", &["reasoning", "thinking"]),
+    ("thinking", &["reasoning", "thinking"]),
+];
+
+/// The role a name says it has, if it says one.
+fn role_of(tokens: &[String]) -> Option<String> {
+    for token in tokens {
+        let lower = token.to_lowercase();
+        if !ROLE_WORDS.contains(&lower.as_str()) {
+            continue;
+        }
+        for (name, aliases) in ROLE_ALIASES {
+            if aliases.contains(&lower.as_str()) {
+                return Some((*name).to_string());
+            }
+        }
+        return Some(lower);
+    }
+    None
+}
+
 /// Is a donor the model these weights actually are?
 ///
 /// An adapter is fitted to the weights it was built on. Two models with the
@@ -541,23 +584,31 @@ const ROLE_WORDS: &[&str] = &[
 /// an adapter fitted to one of them does nothing for the other, or worse.
 ///
 /// The weights say what they are, in their own name. The donor says what it
-/// is, in its repository name. When the weights carry a word the donor does
-/// not have - `Instruct` where the donor is plain `Qwen2.5-0.5B` - they are
-/// different models, and the adapter belongs to the other one.
+/// is, in its repository name. When the two disagree about the role, they
+/// are different models, and the adapter belongs to the other one.
+///
+/// The comparison goes both ways. Weights that say nothing are not held
+/// against a donor that says something - there are plenty of models whose
+/// name says nothing - but a donor that says `Instruct` for weights that say
+/// `Base` is a mismatch, and so is the other way round.
 pub fn donor_matches_weights(donor: &str, weights_name: &str) -> bool {
     let donor = donor.rsplit('/').next().unwrap_or(donor);
-    let donor_tokens: Vec<String> = tokens(donor);
-    let weight_tokens: Vec<String> = tokens(weights_name);
+    let donor_tokens = tokens(donor);
+    let weight_tokens = tokens(weights_name);
 
-    for token in &weight_tokens {
-        if !ROLE_WORDS.contains(&token.to_lowercase().as_str()) {
-            continue;
-        }
-        if !donor_tokens.iter().any(|t| t == token) {
-            return false;
-        }
+    let donor_role = role_of(&donor_tokens);
+    let weight_role = role_of(&weight_tokens);
+
+    match (donor_role, weight_role) {
+        // The weights say nothing, so there is nothing to disagree with.
+        (_, None) => true,
+        // The donor says nothing about its role - it is a plain repository of
+        // the family - and the weights claim one. A plain repository is the
+        // base model, and an adapter fitted to the base model does nothing
+        // for the instruction tuned one. So this is a mismatch.
+        (None, Some(_)) => false,
+        (Some(donor), Some(weights)) => donor == weights,
     }
-    true
 }
 
 /// The words of a name, lowercased and without the punctuation.
@@ -955,6 +1006,18 @@ pub fn find_donor(target: &Signature, spec: &str, hint: &Hint) -> Donor {
             Shape::Missing => {}
         }
     }
+    // A model with the same shape is not the same model. The base model and
+    // the instruct one have the same shape by construction, and an adapter
+    // fitted on one of them does nothing to the other: it binds, and the
+    // weights are quietly wrong.
+    //
+    // The weights say which one they are, so the donor that matches them is
+    // tried first. The order is otherwise kept, so a donor that does match
+    // is not put behind one that does not.
+    if let Some(name) = &hint.name {
+        found.sort_by_key(|repo| !donor_matches_weights(repo, name));
+    }
+
     let (repo, alternatives) = match found.split_first() {
         Some((first, rest)) => (Some(first.clone()), rest.to_vec()),
         None => (None, Vec::new()),
@@ -966,7 +1029,6 @@ pub fn find_donor(target: &Signature, spec: &str, hint: &Hint) -> Donor {
         problem: if problem.is_none() { None } else { Some(problem) },
     }
 }
-
 /// Split a model name from its tag: `qwen3:8b` is `qwen3` and `8b`.
 pub fn split_tag(spec: &str) -> (&str, &str) {
     match spec.rsplit_once(':') {
@@ -1067,6 +1129,31 @@ mod tests {
         assert!(donor_matches_weights(
             "Qwen/Qwen2.5-Coder-7B-Instruct",
             "Qwen2.5 Coder 7B Instruct"
+        ));
+    }
+
+    #[test]
+    fn two_spellings_of_the_same_role_are_the_same_role() {
+        // `-it` and `-Instruct` are the same thing, written two ways. If they
+        // were different, the terminal would build the same adapter again and
+        // again, and never be satisfied.
+        assert!(donor_matches_weights(
+            "Qwen/Qwen2.5-0.5B-it",
+            "Qwen2.5 0.5B Instruct"
+        ));
+        assert!(donor_matches_weights(
+            "Qwen/Qwen2.5-0.5B-Instruct",
+            "Qwen2.5 0.5B it"
+        ));
+    }
+
+    #[test]
+    fn a_base_donor_does_not_match_instruction_tuned_weights() {
+        // The case that bit us: the adapter was fitted on the base model and
+        // bound to the instruction tuned one, and did nothing at all.
+        assert!(!donor_matches_weights(
+            "Qwen/Qwen3-0.6B",
+            "Qwen3 0.6B Instruct"
         ));
     }
 

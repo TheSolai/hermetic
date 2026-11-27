@@ -89,6 +89,12 @@ pub struct ServeRequest {
     pub adapter: Option<PathBuf>,
     /// The weights to serve, when they are already a file on disk.
     pub weights: Option<PathBuf>,
+    /// Are the adapter already folded into the weights?
+    ///
+    /// A model whose attention output is not square cannot have an adapter
+    /// bound to it, so the adapter is folded into the weights instead. The
+    /// weights have been changed either way - the runtime has to say so.
+    pub merged: bool,
     /// A prompt-level policy, for models whose weights cannot be changed.
     pub policy: Option<crate::policy::Policy>,
     /// How many layers of context to ask for.
@@ -103,9 +109,15 @@ impl ServeRequest {
             signature,
             adapter: None,
             weights: None,
+            merged: false,
             policy: None,
             context: 4096,
         }
+    }
+
+    /// Have the weights been changed, one way or another?
+    pub fn is_modified(&self) -> bool {
+        self.adapter.is_some() || self.merged
     }
 }
 
@@ -117,6 +129,14 @@ pub struct ServeHandle {
     pub mode: ServeMode,
     /// The model's name on that endpoint.
     pub model: String,
+    /// Which runtime served it.
+    ///
+    /// The plan says which runtime should serve the model; this says which
+    /// one did. They are not always the same - a model whose weights are in
+    /// a form llama.cpp cannot read is served by Ollama instead - and the
+    /// difference matters, because a runtime that cannot bind an adapter
+    /// serves the model as it is.
+    pub runtime: String,
     /// Anything worth telling the user about how this was served.
     pub notes: Vec<String>,
     /// How to stop it again.
@@ -130,9 +150,30 @@ impl ServeHandle {
             endpoint: endpoint.to_string(),
             mode,
             model: model.to_string(),
+            runtime: String::new(),
             notes: Vec::new(),
             stop: Box::new(|| {}),
         }
+    }
+
+    /// Say which runtime served the model.
+    pub fn served_by(mut self, runtime: &str) -> ServeHandle {
+        self.runtime = runtime.to_string();
+        self
+    }
+}
+
+/// The handle is shown in error messages, but the way to stop the server is a
+/// closure, which cannot be printed.
+impl std::fmt::Debug for ServeHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServeHandle")
+            .field("endpoint", &self.endpoint)
+            .field("mode", &self.mode)
+            .field("model", &self.model)
+            .field("runtime", &self.runtime)
+            .field("notes", &self.notes)
+            .finish_non_exhaustive()
     }
 }
 

@@ -59,6 +59,37 @@ impl Registry {
         self.root.join("merged")
     }
 
+    /// What the probe found, the last time it was run.
+    ///
+    /// The probe is the record of what the models on this machine actually
+    /// do: how often they refuse, next to how often the untouched model
+    /// refused. It is kept per shape, because that is what an adapter is
+    /// keyed by.
+    pub fn probes_dir(&self) -> PathBuf {
+        self.root.join("probes")
+    }
+
+    /// The probe record for a shape, if it has one.
+    pub fn probe_record_for(&self, sig: &Signature) -> Option<ProbeRecord> {
+        let path = self.probes_dir().join(format!("{}.json", sig.key()));
+        let text = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    /// Keep the probe record for a shape.
+    pub fn save_probe_record(&self, sig: &Signature, record: &ProbeRecord) -> Result<()> {
+        let dir = self.probes_dir();
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}.json", sig.key()));
+        let text = serde_json::to_string_pretty(record)?;
+        // Written in one go and moved into place: a record that was half
+        // written would be read back as no record at all.
+        let staging = staging_path(&path);
+        std::fs::write(&staging, text)?;
+        replace(&staging, &path)?;
+        Ok(())
+    }
+
     /// A merged model for a shape, if we have built one.
     pub fn merged_for(&self, sig: &Signature) -> Option<PathBuf> {
         let path = self.merged_dir().join(format!("{}.gguf", sig.key()));
@@ -110,6 +141,11 @@ impl Registry {
     /// study has run is what it has. When the first is bigger than the
     /// second, the optimiser has more to do, and the adapter next to the
     /// study is from an earlier, weaker ablation.
+    ///
+    /// When the number wanted is not known - the profile could not be read -
+    /// the answer is yes. Asking the optimiser is the safe direction: it
+    /// costs time, while the other answer freezes the study at its weakest
+    /// trial and that weak adapter is served for ever.
     pub fn study_needs_more_trials(
         &self,
         sig: &Signature,
@@ -118,7 +154,7 @@ impl Registry {
     ) -> bool {
         match wanted {
             Some(wanted) => self.study_trial_count(sig, donor) < wanted,
-            None => false,
+            None => true,
         }
     }
 
@@ -173,15 +209,21 @@ impl Registry {
         if target.exists() {
             return Ok(target);
         }
-        match std::fs::hard_link(source, &target) {
-            Ok(()) => return Ok(target),
+        // Linked into a staging name first: a copy that is interrupted leaves
+        // a half-written file, and a half-written model that is later served
+        // is a model that answers in nonsense.
+        let staging = staging_path(&target);
+        let _ = std::fs::remove_file(&staging);
+        match std::fs::hard_link(source, &staging) {
+            Ok(()) => {}
             Err(_) => {
-                std::fs::copy(source, &target).with_context(|| {
+                std::fs::copy(source, &staging).with_context(|| {
                     format!("copy {} into the cache", source.display())
                 })?;
-                Ok(target)
             }
         }
+        replace(&staging, &target)?;
+        Ok(target)
     }
 
     /// Build the adapter for a shape from a donor repository.
@@ -223,8 +265,11 @@ impl Registry {
             return Ok(build_dir);
         }
 
-        let _ = std::fs::remove_dir_all(&build_dir);
-        std::fs::create_dir_all(&build_dir)?;
+        // The build directory is emptied, but the adapter that is in it is
+        // kept: a run that fails halfway through must not leave the machine
+        // with nothing to serve. The optimiser overwrites it when it gets
+        // as far as exporting a new one.
+        let _ = std::fs::create_dir_all(&build_dir)?;
 
         let mut cmd = Command::new(python);
         cmd.current_dir(bridge_dir)
@@ -357,6 +402,22 @@ impl Registry {
         self.gguf_is_stale(sig, self.merged_for(sig))
     }
 
+    /// Is the adapter for this shape made for this donor?
+    ///
+    /// An adapter is fitted to the weights it was built on. The donor is
+    /// written into the adapter's own configuration, so it can be read back
+    /// and compared with the one that is wanted. When they are not the same
+    /// model, the adapter on disk is not the one that is wanted - and saying
+    /// "fresh" would serve the wrong one.
+    pub fn adapter_is_for_donor(&self, sig: &Signature, donor: &str) -> bool {
+        match self.donor_of(sig) {
+            Some(on_disk) => on_disk == donor,
+            // Nothing says which model it was made for, so nothing can be
+            // said against it either.
+            None => true,
+        }
+    }
+
     fn gguf_is_stale(&self, sig: &Signature, gguf: Option<PathBuf>) -> bool {
         let (Some(peft), Some(gguf)) = (self.peft_adapter_for(sig), gguf) else {
             return false;
@@ -388,7 +449,12 @@ impl Registry {
 
         let converter = llama_cpp.join("convert_lora_to_gguf.py");
         let out_file = self.adapters_dir().join(format!("{key}.gguf"));
-        let _ = std::fs::remove_file(&out_file);
+        // The converter writes to a temporary name and it is moved into
+        // place afterwards. A converter that is interrupted leaves a
+        // half-written file, and a half-written adapter that is later
+        // trusted is worse than no adapter at all.
+        let staging = staging_path(&out_file);
+        let _ = std::fs::remove_file(&staging);
 
         let conv = Command::new(python)
             .current_dir(llama_cpp)
@@ -398,7 +464,7 @@ impl Registry {
             .arg("--base-model-id")
             .arg(donor)
             .arg("--outfile")
-            .arg(&out_file)
+            .arg(&staging)
             .arg("--outtype")
             .arg("f16")
             .stdin(Stdio::null())
@@ -407,12 +473,14 @@ impl Registry {
             .status()
             .with_context(|| format!("run {}", converter.display()))?;
 
-        if !conv.success() || !out_file.exists() {
+        if !conv.success() || !staging.exists() {
+            let _ = std::fs::remove_file(&staging);
             anyhow::bail!(
                 "could not convert the adapter to GGUF ({} failed)",
                 converter.display()
             );
         }
+        replace(&staging, &out_file)?;
 
         Ok(out_file)
     }
@@ -504,7 +572,8 @@ impl Registry {
 
         let converter = llama_cpp.join("convert_hf_to_gguf.py");
         let out_file = self.merged_dir().join(format!("{key}.gguf"));
-        let _ = std::fs::remove_file(&out_file);
+        let staging = staging_path(&out_file);
+        let _ = std::fs::remove_file(&staging);
 
         let conv = Command::new(python)
             .current_dir(llama_cpp)
@@ -512,7 +581,7 @@ impl Registry {
             .arg(&converter)
             .arg(&merged_dir)
             .arg("--outfile")
-            .arg(&out_file)
+            .arg(&staging)
             .arg("--outtype")
             .arg("f16")
             .stdin(Stdio::null())
@@ -521,14 +590,72 @@ impl Registry {
             .status()
             .with_context(|| format!("run {}", converter.display()))?;
 
-        if !conv.success() || !out_file.exists() {
+        if !conv.success() || !staging.exists() {
+            let _ = std::fs::remove_file(&staging);
             anyhow::bail!(
                 "could not convert the merged model to GGUF ({} failed)",
                 converter.display()
             );
         }
+        replace(&staging, &out_file)?;
 
         Ok(out_file)
+    }
+}
+
+/// Where a file is written before it is moved into place.
+///
+/// The name is next to the real one, so the move is on the same filesystem
+/// and is atomic: a reader sees the old file or the new one, never half of
+/// either.
+fn staging_path(final_path: &Path) -> PathBuf {
+    let mut name = final_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".building");
+    final_path.with_file_name(name)
+}
+
+/// Move a finished file into place.
+fn replace(staging: &Path, final_path: &Path) -> Result<()> {
+    std::fs::rename(staging, final_path).with_context(|| {
+        format!(
+            "move {} into place at {}",
+            staging.display(),
+            final_path.display()
+        )
+    })
+}
+
+/// What the probe found.
+///
+/// The probe asks a model the questions it was judged on, and counts the
+/// answers that look like a refusal. The score of the untouched model comes
+/// with it, because a number on its own says little.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProbeRecord {
+    /// What was measured - "Refusals", for the refusal probe.
+    pub name: String,
+    /// How many answers looked like a refusal.
+    pub matches: usize,
+    /// How many answers there were.
+    pub total: usize,
+    /// How often the untouched model refused the same questions.
+    #[serde(default)]
+    pub baseline: Option<f64>,
+    /// When it was measured, in seconds since the epoch.
+    pub when: f64,
+}
+
+impl ProbeRecord {
+    /// One line about what the probe found.
+    pub fn summary(&self) -> String {
+        let mut summary = format!("{} {}/{}", self.name, self.matches, self.total);
+        if let Some(baseline) = self.baseline {
+            summary.push_str(&format!(
+                " · the untouched model refused {:.0}%",
+                baseline * 100.0
+            ));
+        }
+        summary
     }
 }
 

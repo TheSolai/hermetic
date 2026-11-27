@@ -52,9 +52,14 @@ pub struct Writer {
 
 impl Writer {
     /// Send an answer back to the engine.
+    ///
+    /// The write has a timeout. An engine that has stopped reading would
+    /// otherwise block the terminal's event loop forever - and the terminal
+    /// is what the user is looking at.
     pub fn send(&mut self, answer: &Answer) -> io::Result<()> {
         let mut line = serde_json::to_string(answer).map_err(io::Error::other)?;
         line.push('\n');
+        let _ = self.inner.set_write_timeout(Some(Duration::from_secs(10)));
         self.inner.write_all(line.as_bytes())?;
         self.inner.flush()
     }
@@ -65,7 +70,6 @@ pub struct Hub {
     /// Events from every engine, tagged with the connection they came from.
     pub events: std::sync::mpsc::Receiver<(u64, Event)>,
     writers: Arc<Mutex<HashMap<u64, Writer>>>,
-    next_id: Arc<AtomicU64>,
     path: std::path::PathBuf,
 }
 
@@ -110,10 +114,13 @@ impl Hub {
                             Err(_) => break,
                         }
                     }
-                    // The engine is gone: stop routing answers to it.
+                    // The engine is gone: stop routing answers to it, and say
+                    // so, so the terminal does not keep a panel row for an
+                    // engine that finished minutes ago.
                     if let Ok(mut map) = writers.lock() {
                         map.remove(&id);
                     }
+                    let _ = tx.send((id, Event::Gone {}));
                 });
             }
         });
@@ -121,14 +128,8 @@ impl Hub {
         Ok(Hub {
             events: rx,
             writers,
-            next_id,
             path: path.to_path_buf(),
         })
-    }
-
-    /// The id the next engine will get.
-    pub fn next_id(&self) -> u64 {
-        self.next_id.load(Ordering::Relaxed)
     }
 
     /// Send an answer to one engine.
@@ -146,12 +147,6 @@ impl Hub {
         }
     }
 
-    /// Forget an engine that has finished.
-    pub fn drop_engine(&self, id: u64) {
-        if let Ok(mut map) = self.writers.lock() {
-            map.remove(&id);
-        }
-    }
 }
 
 impl Drop for Hub {

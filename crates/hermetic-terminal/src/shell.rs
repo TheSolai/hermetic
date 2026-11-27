@@ -16,7 +16,13 @@ use anyhow::{Context, Result};
 /// A running shell.
 pub struct Shell {
     master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// Bytes waiting to be written to the shell.
+    ///
+    /// The write itself happens on a thread of its own. Writing to a PTY
+    /// whose reader is not reading blocks, and the terminal's event loop
+    /// would stop: the panel would freeze and the user could not even
+    /// press Ctrl-C.
+    input: mpsc::Sender<Vec<u8>>,
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
     exited: Arc<AtomicBool>,
     /// Bytes the shell wrote.
@@ -83,9 +89,21 @@ impl Shell {
             }
         });
 
+        // The writing half, on a thread of its own.
+        let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
+        thread::spawn(move || {
+            let mut writer = writer;
+            while let Ok(bytes) = input_rx.recv() {
+                if writer.write_all(&bytes).is_err() {
+                    break;
+                }
+                let _ = writer.flush();
+            }
+        });
+
         Ok(Shell {
             master: Arc::new(Mutex::new(master)),
-            writer: Arc::new(Mutex::new(writer)),
+            input: input_tx,
             child: Arc::new(Mutex::new(child)),
             exited: Arc::new(AtomicBool::new(false)),
             output: rx,
@@ -93,11 +111,11 @@ impl Shell {
     }
 
     /// Send bytes to the shell (the user's typing).
+    ///
+    /// This never blocks: the bytes are queued and written by the shell's
+    /// own thread.
     pub fn write(&self, bytes: &[u8]) {
-        if let Ok(mut w) = self.writer.lock() {
-            let _ = w.write_all(bytes);
-            let _ = w.flush();
-        }
+        let _ = self.input.send(bytes.to_vec());
     }
 
     /// Send a line (with newline) to the shell.
@@ -131,13 +149,6 @@ impl Shell {
             }
         }
         false
-    }
-
-    /// Wait for the shell to exit.
-    pub fn wait(&self) {
-        if let Ok(mut c) = self.child.lock() {
-            let _ = c.wait();
-        }
     }
 
     /// Stop the shell.

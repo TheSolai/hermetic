@@ -181,7 +181,8 @@ impl ModelRuntime for OllamaRuntime {
         // Ollama speaks the OpenAI API, so the terminal's one chat client
         // works with it unchanged.
         let endpoint = crate::chat::base_url(&self.host, self.port);
-        let mut handle = ServeHandle::new(&endpoint, ServeMode::PromptPolicy, name);
+        let mut handle =
+            ServeHandle::new(&endpoint, ServeMode::PromptPolicy, name).served_by(self.id());
         handle.notes.push(
             "served by Ollama's own engine; its weights cannot be changed, \
              so a prompt-level policy is used"

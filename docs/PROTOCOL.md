@@ -123,6 +123,18 @@ The parameters are being applied to the model now.
 `payload.choices` is a **projection** for display. Its `value` field is a
 string rendering of the underlying Python object, not the object.
 
+### `probe`
+
+```json
+{"event": "probe", "name": "Refusals", "matches": 4, "total": 16,
+ "tab": 2, "summary": "Refusals 4/16 · the untouched model refused 92%"}
+```
+
+The model was asked the questions it was judged on, and this is how it
+answered. `tab` is the tab the model is being served in - without it the score
+cannot be put next to the right model, because two tabs can be running two
+models. `summary` is one line with the score of the untouched model in it.
+
 ### `done`
 
 ```json
@@ -138,6 +150,15 @@ The engine finished. `exit_code` is 0 on success and non-zero on failure.
 ```
 
 The engine crashed.
+
+### `gone`
+
+```json
+{"event": "gone"}
+```
+
+The engine's socket closed. The channel sends this, not the engine: without it
+the terminal keeps a panel row for an engine that finished minutes ago.
 
 ## Answers
 

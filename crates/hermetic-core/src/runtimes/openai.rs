@@ -13,7 +13,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use serde_json::json;
 
 use crate::http;
 use crate::runtime::{Modification, ModelRuntime, ServeHandle, ServeMode, ServeRequest};
@@ -46,11 +45,16 @@ impl OpenAiRuntime {
     }
 
     /// Does the server answer?
+    ///
+    /// The list of models is asked for with a GET. A POST is what Ollama's
+    /// own runtime avoids for the same reason: a server that only answers
+    /// GET replies 405 to a POST, and a running server would then be
+    /// reported as a server that is not running.
     pub fn is_answering(&self) -> bool {
         let Ok((host, port)) = self.address() else {
             return false;
         };
-        http::post_json(&host, port, "/v1/models", &json!({})).is_ok()
+        http::get_json(&host, port, "/v1/models").is_ok()
     }
 
     /// The models the server says it has.
@@ -58,7 +62,7 @@ impl OpenAiRuntime {
         let Ok((host, port)) = self.address() else {
             return Vec::new();
         };
-        let Ok(answer) = http::post_json(&host, port, "/v1/models", &json!({})) else {
+        let Ok(answer) = http::get_json(&host, port, "/v1/models") else {
             return Vec::new();
         };
         answer
@@ -111,7 +115,8 @@ impl ModelRuntime for OpenAiRuntime {
                 self.base_url
             );
         }
-        let mut handle = ServeHandle::new(&self.base_url, ServeMode::PromptPolicy, &self.model);
+        let mut handle = ServeHandle::new(&self.base_url, ServeMode::PromptPolicy, &self.model)
+            .served_by(self.id());
         handle.notes.push(format!(
             "served by {} at {}; its weights cannot be changed, so a \
              prompt-level policy is used",

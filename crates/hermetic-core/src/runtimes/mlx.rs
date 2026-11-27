@@ -218,6 +218,16 @@ impl ModelRuntime for MlxRuntime {
         let ModelSource::Mlx { path, .. } = &request.source else {
             anyhow::bail!("MLX does not serve {}", request.source.label());
         };
+        // MLX cannot bind a LoRA, and it serves the folder it is given.
+        // A model whose adapter is still to be bound cannot be served here
+        // at all: the untouched model would be served instead, and the
+        // terminal would say it was hereticed when it was not.
+        if request.adapter.is_some() {
+            anyhow::bail!(
+                "MLX cannot bind an adapter to a model - the adapter has to be folded into \
+                 the weights first"
+            );
+        }
         if !self.has_mlx() {
             anyhow::bail!(
                 "mlx-lm is not installed for {} - install it with `pip install mlx-lm`",
@@ -228,7 +238,10 @@ impl ModelRuntime for MlxRuntime {
         let mut server = Server::start(&self.python, path, port)?;
         server.wait_ready(START_TIMEOUT)?;
 
-        let mode = if request.adapter.is_some() {
+        // The folder MLX serves may be one the adapter was folded into, or
+        // the untouched model. Only the second is served here, so that is
+        // what is said.
+        let mode = if request.merged {
             ServeMode::WeightModified
         } else {
             ServeMode::Native
@@ -242,10 +255,14 @@ impl ModelRuntime for MlxRuntime {
             .unwrap_or_else(|_| path.to_path_buf())
             .display()
             .to_string();
-        let mut handle = ServeHandle::new(&endpoint, mode, &name);
-        handle.notes.push(format!(
-            "served by mlx_lm.server on port {port}, with the adapter folded into the weights"
-        ));
+        let mut handle = ServeHandle::new(&endpoint, mode, &name).served_by(self.id());
+        // MLX cannot bind an adapter, so the adapter is always folded into
+        // the weights. Saying so when it did not happen would be a lie.
+        handle.notes.push(if request.is_modified() {
+            format!("served by mlx_lm.server on port {port}, with the adapter folded into the weights")
+        } else {
+            format!("served by mlx_lm.server on port {port}, with the weights as they are")
+        });
         let pid = server.child.id() as i32;
         handle.stop = Box::new(move || {
             unsafe {

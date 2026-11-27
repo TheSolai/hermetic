@@ -145,11 +145,19 @@ pub fn plan(
     };
 
     let reason = match mode {
-        ServeMode::WeightModified => format!(
-            "{} can bind a Heretic adapter to {}",
-            runtime.name(),
-            descriptor.label()
-        ),
+        ServeMode::WeightModified => match descriptor.adapter {
+            // The adapter is folded into the weights, not bound to them.
+            crate::source::AdapterState::Merged => format!(
+                "{} serves {} with the adapter folded into its weights",
+                runtime.name(),
+                descriptor.label()
+            ),
+            _ => format!(
+                "{} can bind a Heretic adapter to {}",
+                runtime.name(),
+                descriptor.label()
+            ),
+        },
         ServeMode::PromptPolicy => format!(
             "{} cannot change the weights of {}, so a prompt-level policy is used",
             runtime.name(),

@@ -138,7 +138,65 @@ untouched model goes with them, because "6 of 16" is only good news next to
 "it used to be 99 of 100".
 
 The probe runs in the background: the model is ready to talk to at once, and
-the answer arrives a moment later.
+the answer arrives a moment later. The measurement is kept, so `/why` can
+report it without asking again, and `/probe` re-measures it whenever the user
+wants a fresh number.
+
+## Serving the model is not building it
+
+The profile asks for twenty trials. A study that has run four has more to give,
+and the adapter next to it is from an earlier, weaker ablation.
+
+It used to follow that a model could not be served until the study was
+finished. So asking for a model that had an adapter already started an
+optimiser run that took an hour - before the model said anything at all.
+
+But the person who asked for the model wants to **talk to it**. The adapter
+that is on disk works. So it is served, and the better one is something they
+can ask for:
+
+```
+note      this adapter can still be improved
+          type /improve to spend the time on a better one
+```
+
+The optimiser costs tens of minutes on a big model, and tens of gigabytes of
+memory. Nobody should pay for that by surprise. `/improve` runs it in the
+background - the model keeps answering while it works - and says so when it is
+done.
+
+This is the same rule as everywhere else in the product: **the expensive
+thing is never done without being asked for**.
+
+## The mode says what happened, not what was planned
+
+There are three ways a model can be served:
+
+- the adapter is **bound** to the weights at runtime (llama.cpp, `--lora`);
+- the adapter is **folded into** the weights, and the result is an ordinary
+  model (an architecture llama.cpp will not bind a LoRA to, or a model with no
+  GGUF of its own);
+- the weights are served **as they are**, under a prompt-level policy (a
+  closed API, or a runtime that cannot touch the weights).
+
+The first two are the same thing to the user - the weights were changed - and
+the third is not. So the mode says `hereticed` for both of the first, and
+`as it is` for the third, and never says the adapter was "bound in" when it
+was folded in.
+
+A model whose attention output is not square cannot have an adapter bound to
+it: llama.cpp reshapes such a tensor when it loads the model, and the adapter
+no longer fits it. Qwen 2 has square attention and binds; Gemma 2 and Qwen 3
+do not, and fold. This was found by binding Qwen 3's adapter anyway and
+watching the model answer "capital" where it used to answer "Paris".
+
+## The plan and what happened are both said
+
+The planner picks a runtime from what the source is. What it picks is not
+always what serves it - a model Ollama keeps as safetensors cannot be read by
+llama.cpp at all - so the runtime that actually served the model is reported
+too, and the difference is said out loud. It matters: a runtime that cannot
+bind an adapter serves the model unchanged.
 
 ## Which trial is kept
 Heretic optimises an ablation: it tries a number of ways to remove a model's

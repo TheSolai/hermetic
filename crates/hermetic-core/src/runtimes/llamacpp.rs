@@ -139,7 +139,7 @@ impl Server {
                     if line.contains(READY_MARKER) {
                         return Ok(());
                     }
-                    if line.contains("error") && line.contains("lora") {
+                    if adapter_failed(&line) {
                         bail!("llama-server refused the adapter: {line}");
                     }
                 }
@@ -188,6 +188,28 @@ impl Drop for Server {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Did llama.cpp refuse the adapter?
+///
+/// A LoRA that does not fit the weights is not an error the server stops
+/// for: it is a line in the log, and the model is served *without* the
+/// adapter. The terminal would then say the model is hereticed when it is
+/// not, so the line has to be recognised.
+///
+/// llama.cpp says "failed to load LoRA adapter" and "cannot apply LoRA", in
+/// either case. The word is capitalised, and the word "error" is not
+/// always there, so the test is on the parts that always are.
+pub fn adapter_failed(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    if !lower.contains("lora") && !lower.contains("adapter") {
+        return false;
+    }
+    lower.contains("fail")
+        || lower.contains("error")
+        || lower.contains("cannot")
+        || lower.contains("incompatible")
+        || lower.contains("not supported")
 }
 
 /// Is this log line worth showing to the user?
@@ -273,7 +295,7 @@ impl ModelRuntime for LlamaCppRuntime {
         )?;
         server.wait_ready(Duration::from_secs(600))?;
 
-        let mode = if request.adapter.is_some() {
+        let mode = if request.is_modified() {
             ServeMode::WeightModified
         } else {
             ServeMode::Native
@@ -282,10 +304,17 @@ impl ModelRuntime for LlamaCppRuntime {
             .unwrap_or_else(|| weights.display().to_string());
         let endpoint = crate::chat::base_url("127.0.0.1", port);
         let pid = server.child_id();
-        let mut handle = ServeHandle::new(&endpoint, mode, &name);
-        handle.notes.push(format!(
-            "served by llama.cpp on port {port}, with the adapter bound in"
-        ));
+        let mut handle = ServeHandle::new(&endpoint, mode, &name).served_by(self.id());
+        // Say what was actually done. An adapter bound in and an adapter
+        // folded into the weights are different things, and the difference
+        // is the whole point of the product.
+        handle.notes.push(match (request.adapter.is_some(), request.merged) {
+            (true, _) => format!("served by llama.cpp on port {port}, with the adapter bound in"),
+            (false, true) => format!(
+                "served by llama.cpp on port {port}, with the adapter folded into the weights"
+            ),
+            (false, false) => format!("served by llama.cpp on port {port}, with the weights as they are"),
+        });
         handle.stop = Box::new(move || {
             unsafe {
                 libc::kill(pid, libc::SIGKILL);

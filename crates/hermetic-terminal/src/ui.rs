@@ -40,6 +40,8 @@ const PANEL_BG: Color = Color::Indexed(234);
 const PANEL_BORDER: Color = Color::Indexed(240);
 const PRIMARY: Color = Color::Indexed(252);
 const SECONDARY: Color = Color::Indexed(246);
+/// The quietest colour: for what is there, but not the point.
+const MUTED: Color = Color::Indexed(240);
 const ACCENT: Color = Color::Indexed(80);
 const BAR_BG: Color = Color::Indexed(236);
 const BAR_FG: Color = Color::Indexed(248);
@@ -203,12 +205,43 @@ fn draw_panel(frame: &mut Frame, area: Rect, app: &mut App) {
     // What the engine is doing.
     if !app.engines.is_empty() {
         lines.push(head_line("ENGINE"));
-        for line in app.summary() {
-            lines.push(detail_line(&shorten(&line, width)));
+        for line in app.summary(width) {
+            if line.dim {
+                lines.push(faint_line(&line.text));
+            } else {
+                lines.push(detail_line(&line.text));
+            }
         }
         lines.push(Line::from(""));
     } else if tab.model.is_none() {
         lines.push(detail_line("Type a model command, or click one below."));
+        lines.push(Line::from(""));
+    }
+
+    // A question the engine asked. It is answered on the user's behalf -
+    // the engine's own default - but it is shown, because a question that
+    // nobody sees is a question that nobody can trust the answer to.
+    if let Some(question) = &app.question {
+        lines.push(head_line("THE ENGINE ASKS"));
+        lines.push(detail_line(&shorten(&question.message, width)));
+        for choice in question.choices.iter().take(3) {
+            lines.push(faint_line(&shorten(
+                &format!("  · {}", choice),
+                width.saturating_sub(2),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // The last few things that happened. This is where an error that the
+    // user did not cause becomes visible: before this, a failed engine left
+    // no trace on the screen at all.
+    let recent = app.log.iter().rev().take(6).collect::<Vec<_>>();
+    if !recent.is_empty() {
+        lines.push(head_line("LOG"));
+        for line in recent.into_iter().rev() {
+            lines.push(faint_line(&shorten(line, width)));
+        }
         lines.push(Line::from(""));
     }
 
@@ -217,7 +250,12 @@ fn draw_panel(frame: &mut Frame, area: Rect, app: &mut App) {
     let shown = app.matches.len();
     let filter = app.list_filter.trim();
     let header = if total == 0 {
-        "MODELS — looking for them...".to_string()
+        if app.catalogue_loaded {
+            // The search finished and there is nothing on this machine.
+            "MODELS — none found".to_string()
+        } else {
+            "MODELS — looking for them...".to_string()
+        }
     } else if filter.is_empty() {
         format!("MODELS ({total})")
     } else {
@@ -256,19 +294,21 @@ fn draw_panel(frame: &mut Frame, area: Rect, app: &mut App) {
     // One line for the hint at the bottom.
     let hint = 1usize;
     let used = lines.len();
-    let mut visible = (inner.height as usize).saturating_sub(used + hint);
-    if visible == 0 {
-        visible = 1;
-    }
+    // When there is no room left, no row is drawn. Drawing one anyway would
+    // put it outside the panel, where it cannot be seen and where a click
+    // would land on nothing.
+    let visible = (inner.height as usize).saturating_sub(used + hint);
 
     // Keep the selection in view.
-    if app.list_selected < app.list_scroll {
-        app.list_scroll = app.list_selected;
-    } else if app.list_selected >= app.list_scroll + visible {
-        app.list_scroll = app.list_selected + 1 - visible;
-    }
-    if app.list_scroll + visible > shown {
-        app.list_scroll = shown.saturating_sub(visible);
+    if visible > 0 {
+        if app.list_selected < app.list_scroll {
+            app.list_scroll = app.list_selected;
+        } else if app.list_selected >= app.list_scroll + visible {
+            app.list_scroll = app.list_selected + 1 - visible;
+        }
+        if app.list_scroll + visible > shown {
+            app.list_scroll = shown.saturating_sub(visible);
+        }
     }
 
     // The rows start right below the header.
@@ -319,13 +359,17 @@ fn draw_panel(frame: &mut Frame, area: Rect, app: &mut App) {
 
 /// One row of the model list: its name, how big it is, where it comes from
 /// and what the terminal can do with it.
+///
+/// The name is cleaned before it is drawn: it can be a file name from disk,
+/// and macOS allows an escape sequence in one. Drawn as it is, the terminal
+/// would run it.
 fn model_row(entry: &CatalogueEntry) -> String {
     format!(
         "{:<17} {:>8} {:<6} {:<9}",
-        shorten(&entry.name, 17),
+        shorten(&crate::clean(&entry.name), 17),
         size_label(entry.size),
         entry.kind.label(),
-        entry.state,
+        shorten(&entry.state, 9),
     )
 }
 
@@ -342,6 +386,14 @@ fn detail_line(text: &str) -> Line<'static> {
     Line::from(Span::styled(
         text.to_string(),
         Style::default().fg(SECONDARY),
+    ))
+}
+
+/// A line of detail that is not the point - the scores, the phase.
+fn faint_line(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_string(),
+        Style::default().fg(MUTED).add_modifier(Modifier::DIM),
     ))
 }
 
@@ -409,7 +461,7 @@ fn tab_strip(app: &mut App, origin_x: u16, origin_y: u16, width: u16) -> Line<'s
         } else {
             Style::default().fg(SECONDARY)
         };
-        let label = format!(" {} ", shorten(&tab.title, 14));
+        let label = format!(" {} ", shorten(&crate::clean(&tab.title), 14));
         let w = label.chars().count() as u16;
         if x + w > tab_limit {
             break;
@@ -439,14 +491,7 @@ fn tab_strip(app: &mut App, origin_x: u16, origin_y: u16, width: u16) -> Line<'s
 }
 
 /// A tab title that fits in the strip.
-fn shorten(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
-    out.push('…');
-    out
-}
+use crate::app::shorten;
 
 /// The last part of a path: the file's name.
 fn file_name(path: &str) -> &str {
@@ -467,8 +512,14 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &mut App) {
         Span::styled(" ", style),
     ];
 
-    let title = app.active_tab().title.clone();
-    spans.push(Span::styled(title, style.add_modifier(Modifier::BOLD)));
+    // The title is cut to a third of the bar, so that the key hints on the
+    // right are always there to be read.
+    let title = crate::clean(&app.active_tab().title);
+    let room = (area.width as usize / 3).clamp(8, 32);
+    spans.push(Span::styled(
+        shorten(&title, room),
+        style.add_modifier(Modifier::BOLD),
+    ));
     if !app.status.is_empty() {
         spans.push(Span::styled(format!("  ·  {}", app.status), style));
     }

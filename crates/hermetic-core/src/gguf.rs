@@ -59,7 +59,21 @@ fn read_string(f: &mut impl Read) -> Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// How deep an array may be nested before the file is called malformed.
+///
+/// A GGUF never nests arrays more than a couple of levels deep. A file that
+/// does is either broken or trying to make the reader recurse until the
+/// stack runs out, and either way it is not a model.
+const MAX_DEPTH: usize = 16;
+
 fn read_value(f: &mut impl Read, vtype: u32) -> Result<Value> {
+    read_value_at(f, vtype, 0)
+}
+
+fn read_value_at(f: &mut impl Read, vtype: u32, depth: usize) -> Result<Value> {
+    if depth > MAX_DEPTH {
+        bail!("the arrays in this file are nested too deeply to be a model");
+    }
     Ok(match vtype {
         0 => {
             let mut b = [0u8; 1];
@@ -112,15 +126,19 @@ fn read_value(f: &mut impl Read, vtype: u32) -> Result<Value> {
             // A GGUF's tokenizer holds a hundred thousand strings. Reading
             // them into memory to throw them away costs seconds per model,
             // and nothing here needs them.
-            if n > 64 {
+            //
+            // A long array of numbers is not skipped, though: a hybrid model
+            // has one feed-forward size per layer, and throwing that away
+            // would give the model the wrong shape.
+            if n > 64 && elem != 10 && elem != 11 && elem != 12 {
                 for _ in 0..n {
-                    skip_value(f, elem)?;
+                    skip_value_at(f, elem, depth + 1)?;
                 }
                 Value::Array(Vec::new())
             } else {
                 let mut out = Vec::new();
                 for _ in 0..n {
-                    out.push(read_value(f, elem)?);
+                    out.push(read_value_at(f, elem, depth + 1)?);
                 }
                 Value::Array(out)
             }
@@ -149,7 +167,10 @@ fn read_value(f: &mut impl Read, vtype: u32) -> Result<Value> {
 /// The reader is buffered, so this is a copy rather than a seek: a GGUF's
 /// tokenizer is a hundred thousand strings, and a syscall each would cost
 /// seconds per model.
-fn skip_value(f: &mut impl Read, vtype: u32) -> Result<()> {
+fn skip_value_at(f: &mut impl Read, vtype: u32, depth: usize) -> Result<()> {
+    if depth > MAX_DEPTH {
+        bail!("the arrays in this file are nested too deeply to be a model");
+    }
     let mut scratch = [0u8; 8192];
     match vtype {
         0 | 1 | 7 => {
@@ -182,7 +203,7 @@ fn skip_value(f: &mut impl Read, vtype: u32) -> Result<()> {
             f.read_exact(&mut count)?;
             let n = u64::from_le_bytes(count);
             for _ in 0..n {
-                skip_value(f, elem)?;
+                skip_value_at(f, elem, depth + 1)?;
             }
         }
         other => bail!("unknown GGUF value type {other}"),
@@ -272,7 +293,21 @@ pub fn signature_of(path: &Path) -> Result<Signature> {
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
+
+    // A file without a shape is not a shape. Saying "unknown, zero layers,
+    // zero width" would give it the key `unknown-0-0-0`, and every such
+    // file on the machine would share one adapter - which is fitted to
+    // neither of them.
     let p = format!("{arch}.");
+    let layers = num(&meta, &format!("{p}block_count"));
+    let hidden = num(&meta, &format!("{p}embedding_length"));
+    if layers == 0 || hidden == 0 {
+        anyhow::bail!(
+            "{} does not say what shape it is - it has no block count or no width",
+            path.display()
+        );
+    }
+
     // A mixture-of-experts model has no shared feed-forward size: it has one
     // per expert, and the shared field is zero.
     let inter = {
@@ -284,8 +319,8 @@ pub fn signature_of(path: &Path) -> Result<Signature> {
         }
     };
     Ok(Signature {
-        layers: num(&meta, &format!("{p}block_count")),
-        hidden: num(&meta, &format!("{p}embedding_length")),
+        layers,
+        hidden,
         inter,
         heads: num(&meta, &format!("{p}attention.head_count")),
         kv_heads: num(&meta, &format!("{p}attention.head_count_kv")),
@@ -295,14 +330,45 @@ pub fn signature_of(path: &Path) -> Result<Signature> {
 }
 
 /// The model name recorded inside the file, if any.
+///
+/// The name is in the header, before the tokenizer - which is a hundred
+/// thousand strings. The reader stops as soon as it has the name, so this
+/// does not walk the whole file.
 pub fn gguf_name(path: &Path) -> Option<String> {
-    let meta = gguf_metadata(path).ok()?;
+    let meta = gguf_metadata_with(path, |meta| meta.contains_key("general.name")).ok()?;
     meta.get("general.name")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
 }
 
-/// Does this model have a rectangular attention output?
+/// The head's own width.
+///
+/// This is the width of one attention head: the output of one head, and the
+/// input of one. The model's width divided by its heads is only the same
+/// thing when the heads are square - which they usually are not. A model
+/// whose heads are wider than that (Qwen 3, for one) has an attention
+/// output that is wider than the model.
+pub fn head_width(meta: &BTreeMap<String, Value>, prefix: &str) -> u64 {
+    // The value length is the one that decides the attention output: it is
+    // the heads' width that the output projection mixes.
+    let value = num(meta, &format!("{prefix}attention.value_length"));
+    if value > 0 {
+        return value;
+    }
+    let key = num(meta, &format!("{prefix}attention.key_length"));
+    if key > 0 {
+        return key;
+    }
+    let hidden = num(meta, &format!("{prefix}embedding_length"));
+    let heads = num(meta, &format!("{prefix}attention.head_count"));
+    if hidden > 0 && heads > 0 {
+        hidden / heads
+    } else {
+        0
+    }
+}
+
+/// Can an adapter be bound to this model's attention output?
 ///
 /// Gemma 2 has eight heads of 256 each and a width of 2304, so its
 /// attention output is 2048 wide and 2304 deep - not square. llama.cpp
@@ -313,6 +379,10 @@ pub fn gguf_name(path: &Path) -> Option<String> {
 ///
 /// The adapter cannot bind to such a model, so it has to be folded into the
 /// weights instead. This is how that is known.
+///
+/// Qwen 3 is the same shape of problem - sixteen heads of 128 each and a
+/// width of 1024 - and it is just as true there: binding its adapter turns
+/// "Paris" into "capital".
 pub fn has_rectangular_attention(path: &Path) -> bool {
     let Ok(meta) = gguf_metadata(path) else {
         return false;
@@ -326,20 +396,12 @@ pub fn has_rectangular_attention(path: &Path) -> bool {
     if hidden == 0 || heads == 0 {
         return false;
     }
-    // The head's own width, when the file says. Without it, the width is
-    // the model's, divided by its heads.
-    let key_length = {
-        let key = num(&meta, &format!("{p}attention.key_length"));
-        if key > 0 {
-            key
-        } else {
-            hidden / heads
-        }
-    };
-    heads * key_length != hidden
+    let width = head_width(&meta, &p);
+    if width == 0 {
+        return false;
+    }
+    heads * width != hidden
 }
-
-/// Read only the header — used to skip the tensor directory quickly.
 pub fn header_size(path: &Path) -> Result<u64> {
     let mut f = File::open(path)?;
     let mut magic = [0u8; 4];
@@ -383,5 +445,58 @@ mod tests {
             experts: 0,
         };
         assert_eq!(s.key(), "qwen3-36-4096-12288");
+    }
+
+    fn meta(pairs: &[(&str, u64)]) -> BTreeMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), Value::U64(*v)))
+            .collect()
+    }
+
+    #[test]
+    fn a_model_with_square_attention_can_bind_an_adapter() {
+        // Qwen 2.5 0.5B: fourteen heads of sixty-four in a width of 896.
+        let m = meta(&[
+            ("qwen2.embedding_length", 896),
+            ("qwen2.attention.head_count", 14),
+            ("qwen2.attention.key_length", 64),
+        ]);
+        assert_eq!(head_width(&m, "qwen2."), 64);
+        assert_eq!(14 * head_width(&m, "qwen2."), 896);
+    }
+
+    #[test]
+    fn a_model_with_wider_heads_cannot_bind_an_adapter() {
+        // Qwen 3 0.6B: sixteen heads of 128 in a width of 1024. The heads
+        // are wider than the model's width divided by its heads, so the
+        // attention output is 2048 wide and the model is not square.
+        let m = meta(&[
+            ("qwen3.embedding_length", 1024),
+            ("qwen3.attention.head_count", 16),
+            ("qwen3.attention.key_length", 128),
+        ]);
+        assert_eq!(head_width(&m, "qwen3."), 128);
+        assert_ne!(16 * head_width(&m, "qwen3."), 1024);
+    }
+
+    #[test]
+    fn the_value_length_decides_the_width_when_the_two_differ() {
+        // The attention output is as wide as the values are, not as wide as
+        // the keys are.
+        let m = meta(&[
+            ("m.embedding_length", 512),
+            ("m.attention.head_count", 4),
+            ("m.attention.key_length", 64),
+            ("m.attention.value_length", 128),
+        ]);
+        assert_eq!(head_width(&m, "m."), 128);
+    }
+
+    #[test]
+    fn a_model_without_a_head_width_is_not_rectangular() {
+        // Nothing is known, so nothing is claimed.
+        let m = meta(&[("m.embedding_length", 512)]);
+        assert_eq!(head_width(&m, "m."), 0);
     }
 }

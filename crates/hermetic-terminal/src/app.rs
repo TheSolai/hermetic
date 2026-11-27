@@ -28,6 +28,11 @@ pub struct Tab {
     pub probe: Option<String>,
     /// The tab's own number, so the shell can tell the terminal who it is.
     pub number: u64,
+    /// Has the shell in this tab ended?
+    ///
+    /// The pane keeps the last thing the shell drew, which looks exactly
+    /// like a terminal that has frozen. The user is told once.
+    pub ended: bool,
 }
 
 impl Tab {
@@ -44,6 +49,7 @@ impl Tab {
             endpoint: None,
             probe: None,
             number,
+            ended: false,
         }
     }
 
@@ -318,18 +324,7 @@ impl App {
 
     /// The tab in front.
     pub fn active_tab(&self) -> &Tab {
-        &self.tabs[self.active.min(self.tabs.len() - 1)]
-    }
-
-    /// The tab in front, mutably.
-    pub fn active_tab_mut(&mut self) -> &mut Tab {
-        let index = self.active.min(self.tabs.len() - 1);
-        &mut self.tabs[index]
-    }
-
-    /// A tab by its number.
-    pub fn tab_mut(&mut self, number: u64) -> Option<&mut Tab> {
-        self.tabs.iter_mut().find(|t| t.number == number)
+        &self.tabs[self.active.min(self.tabs.len().saturating_sub(1))]
     }
 
     /// Open a tab.
@@ -382,17 +377,29 @@ impl App {
             } => {
                 // The interceptor is serving a model: tell the tab it belongs
                 // to what it is talking to.
-                let target =
-                    tab.and_then(|number| self.tabs.iter().position(|t| t.number == number));
-                let index = target.unwrap_or(self.active);
-                if let Some(tab) = self.tabs.get_mut(index) {
-                    tab.model = Some(model.clone());
-                    tab.title = model.clone();
-                    tab.shape = shape.clone();
-                    tab.adapter = adapter.clone();
-                    tab.endpoint = endpoint.clone();
+                //
+                // The tab number is how the shim says which tab it is. When
+                // it does not say - or says a tab that is not there - the
+                // serving is applied to the tab that is waiting for a model,
+                // and to no other. Renaming whatever tab happened to be in
+                // front would be a lie.
+                let target = tab.and_then(|number| self.tabs.iter().position(|t| t.number == number));
+                let index = match target {
+                    Some(index) => Some(index),
+                    None => self.tabs.iter().position(|t| t.model.is_none()),
+                };
+                if let Some(index) = index {
+                    if let Some(tab) = self.tabs.get_mut(index) {
+                        tab.model = Some(model.clone());
+                        tab.title = model.clone();
+                        tab.shape = shape.clone();
+                        tab.adapter = adapter.clone();
+                        tab.endpoint = endpoint.clone();
+                    }
+                    self.push_log(format!("▸ serving {model}"));
+                } else {
+                    self.push_log(format!("▸ serving {model} (no tab to attach it to)"));
                 }
-                self.push_log(format!("▸ serving {model}"));
             }
             Event::Log { text } => {
                 // The engine's own console goes to the terminal the user is
@@ -454,15 +461,37 @@ impl App {
                 name,
                 matches,
                 total,
+                tab,
                 summary,
             } => {
                 // The model was asked the questions it was judged on, and
                 // this is how it answered. The panel says so, because a model
                 // that no longer refuses is the whole point of the thing.
+                //
+                // The score belongs to one model. Putting it next to every
+                // tab that has none would let the wrong number be read as
+                // the right one.
                 let note = summary.unwrap_or_else(|| format!("{name} {matches}/{total}"));
-                for tab in self.tabs.iter_mut() {
-                    if tab.probe.is_none() {
-                        tab.probe = Some(note.clone());
+                let target = tab.and_then(|number| self.tabs.iter().position(|t| t.number == number));
+                match target {
+                    Some(index) => {
+                        if let Some(tab) = self.tabs.get_mut(index) {
+                            tab.probe = Some(note.clone());
+                        }
+                    }
+                    None => {
+                        // The shim did not say which tab. The tab it is
+                        // serving is the one it announced, and that is the
+                        // one the score belongs to.
+                        let serving = self
+                            .tabs
+                            .iter()
+                            .position(|t| t.model.is_some() && t.probe.is_none());
+                        if let Some(index) = serving {
+                            if let Some(tab) = self.tabs.get_mut(index) {
+                                tab.probe = Some(note.clone());
+                            }
+                        }
                     }
                 }
                 self.push_log(note);
@@ -489,6 +518,19 @@ impl App {
                     engine.state = "failed".into();
                 }
                 self.push_log(format!("engine failed: {error}"));
+            }
+            Event::Gone {} => {
+                // The engine's socket closed. It is gone, and its panel row
+                // has to go with it: a row for an engine that finished
+                // minutes ago pushes the model list off the bottom.
+                if let Some(engine) = self.engine_mut(id) {
+                    let label = engine.label.clone();
+                    if engine.state != "done" && !engine.state.starts_with("failed") {
+                        engine.state = "ended".into();
+                    }
+                    self.engines.retain(|e| e.id != id);
+                    self.push_log(format!("{label} has ended"));
+                }
             }
             Event::Unknown => {}
         }
@@ -528,7 +570,8 @@ impl App {
         self.engines.iter_mut().find(|e| e.id == id)
     }
 
-    fn push_log(&mut self, line: String) {
+    /// Keep a line of the log.
+    pub fn push_log(&mut self, line: String) {
         self.log.push(line);
         if self.log.len() > 400 {
             let excess = self.log.len() - 400;
@@ -537,23 +580,75 @@ impl App {
     }
 
     /// The engines and their scores, ready to be drawn.
-    pub fn summary(&self) -> Vec<String> {
+    ///
+    /// The panel is narrow and a model name can be long, so the name is
+    /// shortened to whatever room is left - never the other way round. The
+    /// state and the scores are the reason the user is looking at the panel
+    /// at all, so they get their own line and are never cut off.
+    pub fn summary(&self, width: usize) -> Vec<EngineLine> {
         let mut out = Vec::new();
         for engine in &self.engines {
-            let mut line = format!("{} [{}]", engine.label, engine.state);
+            let room = width.saturating_sub(4);
+            let state = format!("[{}]", engine.state);
+            let label_room = room.saturating_sub(state.chars().count() + 1);
+            out.push(EngineLine {
+                text: format!("  {} {}", shorten(&engine.label, label_room), state),
+                dim: false,
+            });
+
+            // The phase, on a line of its own.
             if !engine.phase.is_empty() {
-                line.push_str(&format!(" · {}", engine.phase));
+                out.push(EngineLine {
+                    text: format!("    {}", shorten(&engine.phase, room)),
+                    dim: true,
+                });
             }
-            if let Some(baseline) = &engine.baseline {
-                line.push_str(&format!("  {baseline}"));
+
+            // The scores, on a line of their own.
+            //
+            // They are the reason the panel is being looked at, and putting
+            // them on the same line as the phase meant the end of them - the
+            // score after the change - was the first thing to be cut.
+            let scores = match (&engine.baseline, &engine.trial) {
+                (Some(baseline), Some(trial)) => format!("{baseline} → {trial}"),
+                (Some(baseline), None) => baseline.clone(),
+                (None, Some(trial)) => trial.clone(),
+                (None, None) => String::new(),
+            };
+            if !scores.is_empty() {
+                out.push(EngineLine {
+                    text: format!("    {}", shorten(&scores, room)),
+                    dim: true,
+                });
             }
-            if let Some(trial) = &engine.trial {
-                line.push_str(&format!(" → {trial}"));
-            }
-            out.push(line);
         }
         out
     }
+}
+
+/// A line of the engine summary.
+///
+/// The dimmer line is the detail: the phase and the scores.
+#[derive(Debug, Clone)]
+pub struct EngineLine {
+    pub text: String,
+    pub dim: bool,
+}
+
+/// A string cut to a width, with an ellipsis when it does not fit.
+///
+/// The cut is on character boundaries, so a name with an accent or an emoji
+/// is not cut in half.
+pub(crate) fn shorten(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 #[cfg(test)]
@@ -631,6 +726,91 @@ mod tests {
         app.push_filter('z');
         assert!(app.matches.is_empty());
         assert!(app.selected_model().is_none());
+    }
+
+    #[test]
+    fn the_probe_goes_next_to_the_model_it_belongs_to() {
+        let mut app = App::new(tab_stub());
+        app.tabs[0].number = 1;
+        app.tabs[0].model = Some("one".into());
+        let second = Tab::new(
+            crate::shell::Shell::spawn("/bin/sh", &std::env::temp_dir(), 8, 20, &[], None)
+                .expect("start a shell"),
+            8,
+            20,
+            2,
+        );
+        app.push_tab(second);
+        app.tabs[1].model = Some("two".into());
+
+        app.on_event(
+            1,
+            Event::Probe {
+                name: "Refusals".into(),
+                matches: 4,
+                total: 16,
+                tab: Some(2),
+                summary: Some("Refusals 4/16".into()),
+            },
+        );
+
+        assert_eq!(app.tabs[0].probe, None);
+        assert_eq!(app.tabs[1].probe.as_deref(), Some("Refusals 4/16"));
+    }
+
+    #[test]
+    fn a_probe_without_a_tab_goes_to_the_model_that_is_being_served() {
+        let mut app = App::new(tab_stub());
+        app.tabs[0].model = Some("one".into());
+
+        app.on_event(
+            1,
+            Event::Probe {
+                name: "Refusals".into(),
+                matches: 1,
+                total: 16,
+                tab: None,
+                summary: Some("Refusals 1/16".into()),
+            },
+        );
+
+        assert_eq!(app.tabs[0].probe.as_deref(), Some("Refusals 1/16"));
+    }
+
+    #[test]
+    fn an_engine_that_has_gone_is_forgotten() {
+        let mut app = App::new(tab_stub());
+        app.engines.push(Engine::new(7));
+        assert_eq!(app.engines.len(), 1);
+
+        app.on_event(7, Event::Gone {});
+        assert!(app.engines.is_empty());
+    }
+
+    #[test]
+    fn the_engines_state_and_scores_are_never_cut_off() {
+        let mut app = App::new(tab_stub());
+        let mut engine = Engine::new(1);
+        engine.label = "adapter for a-very-long-repository-name".into();
+        engine.state = "building".into();
+        engine.phase = "trial 3 of 20".into();
+        engine.baseline = Some("Refusals 92/100".into());
+        engine.trial = Some("Refusals 4/100".into());
+        app.engines.push(engine);
+
+        let lines = app.summary(44);
+        let text = lines
+            .iter()
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The state and the scores are the reason the panel is there.
+        assert!(text.contains("[building]"), "{text}");
+        assert!(text.contains("Refusals 92/100"), "{text}");
+        assert!(text.contains("Refusals 4/100"), "{text}");
+        for line in &lines {
+            assert!(line.text.chars().count() <= 44, "{line:?}");
+        }
     }
 
     /// A tab that does not need a shell.

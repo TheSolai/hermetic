@@ -6,7 +6,7 @@
 //! than pulling in a full HTTP stack.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -17,19 +17,31 @@ pub struct Conn {
     stream: TcpStream,
     buf: Vec<u8>,
     pos: usize,
+    /// The status the server answered with.
+    status: Option<u16>,
 }
 
 impl Conn {
     /// Open a connection to `host:port`.
     pub fn connect(host: &str, port: u16, timeout: Duration) -> Result<Conn> {
-        let stream = TcpStream::connect((host, port))
+        // The connect has a timeout of its own. Without one, a server that
+        // is not there leaves the operating system's default - which on
+        // macOS is two minutes - and the terminal waits for it.
+        let address = (host, port)
+            .to_socket_addrs()
+            .with_context(|| format!("could not resolve {host}"))?
+            .next()
+            .with_context(|| format!("could not resolve {host}:{port}"))?;
+        let stream = TcpStream::connect_timeout(&address, Duration::from_secs(10))
             .with_context(|| format!("could not connect to {host}:{port}"))?;
         stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout)).ok();
         stream.set_nodelay(true).ok();
         Ok(Conn {
             stream,
             buf: Vec::new(),
             pos: 0,
+            status: None,
         })
     }
 
@@ -92,6 +104,7 @@ impl Conn {
     fn read_headers(&mut self) -> Result<(bool, Option<usize>)> {
         let mut chunked = false;
         let mut length = None;
+        let mut status: Option<u16> = None;
         loop {
             let Some(line) = self.read_line()? else {
                 bail!("the connection closed before the headers were complete");
@@ -107,8 +120,15 @@ impl Conn {
                 }
             } else if let Some(v) = lower.strip_prefix("content-length:") {
                 length = v.trim().parse::<usize>().ok();
+            } else if status.is_none() && lower.starts_with("http/") {
+                // The status line: "HTTP/1.1 200 OK".
+                status = lower
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|code| code.parse::<u16>().ok());
             }
         }
+        self.status = status;
         Ok((chunked, length))
     }
 
@@ -248,6 +268,8 @@ pub fn post_sse(
     conn.request("POST", path, Some(&payload))?;
 
     let mut full = String::new();
+    let mut reasoning = String::new();
+    let mut failure: Option<String> = None;
     conn.body_lines(|line| {
         let Some(rest) = line.strip_prefix("data:") else {
             return true;
@@ -269,11 +291,31 @@ pub fn post_sse(
             .pointer("/choices/0/delta/reasoning_content")
             .and_then(|c| c.as_str())
         {
+            // The reasoning is part of the answer: a model that thinks out
+            // loud and then answers, and the answer is what the history
+            // needs to hold.
+            reasoning.push_str(text);
             on_delta(Delta::Reasoning(text));
         }
         true
     })?;
-    Ok(full)
+
+    // A server that failed says so in the status line, and its body has no
+    // events in it. Without this the terminal shows an empty answer and
+    // says nothing about why.
+    if let Some(status) = conn.status {
+        if status >= 400 {
+            failure = Some(format!("the server answered {status}"));
+        }
+    }
+    if let Some(failure) = failure {
+        anyhow::bail!(
+            "{failure} when asking {host}:{port}{path}\n\
+             The model could not be reached."
+        );
+    }
+
+    Ok(if full.is_empty() { reasoning } else { full })
 }
 
 #[cfg(test)]

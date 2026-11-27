@@ -316,6 +316,46 @@ HERMETIC answers that question in the engine's place, and names the
 repository it is answering about. Set `HERMETIC_TRUST_REMOTE_CODE=0` to refuse
 instead; the model is then reported as unloadable, as it should be.
 
+## Commands in a model session
+
+While you are talking to a model, the terminal answers a few commands. They
+are typed at the model's own prompt, so they work wherever the model works.
+
+| Command | What it does |
+|---|---|
+| `/why` | What this model is, and how it is being served: its shape, the adapter bound to it, the runtime serving it, what the plan was, and what the probe found. |
+| `/probe` | Measure, right now, how often this model refuses - and how often the untouched model refused the same questions. The measurement is kept. |
+| `/improve` | Spend time on a better adapter. The optimiser runs more trials over this shape in the background, while the model keeps answering. |
+| `/model` | What the server says about itself. |
+| `/models` | What this machine has. |
+| `/system <text>` | Set the system prompt. |
+| `/clear` | Forget the conversation. |
+| `/help` | The list. |
+| `/exit` | Leave the model. |
+
+`/why` and `/probe` are the same information the panel shows, asked for
+directly. `/improve` is the one that costs something, so it is never done
+without being asked: the optimiser runs for tens of minutes on a big model, and
+nobody should pay for that by surprise.
+
+The probe is also run in the background when a model is served, so the number
+is usually there before you ask for it.
+
+### The rules of the road
+
+- **Asking for a model serves it.** It does not start a build. If the adapter
+  is already there, the model is up in seconds; if it is not, the build runs
+  and the panel shows its progress.
+- **A model you cannot talk to is not built.** An embedding model or a speech
+  model is refused in one line, with the reason.
+- **A model that is not on the machine yet is fetched first**, so that its
+  weights can be read and changed rather than served as they are.
+- **The panel tells the truth.** `hereticed` means the weights were changed.
+  `as it is` means they were not. When a different runtime ends up serving the
+  model than the one that was planned, the terminal says so.
+- **The score is never on its own.** A refusal count is always next to the
+  untouched model's refusal count.
+
 ## Keys
 
 | Key | What it does |
@@ -340,6 +380,7 @@ anyway.
 
 ## See also
 
+- `docs/AUDIT.md` - what works, what did not, and what was changed.
 - `docs/PROTOCOL.md` - the wire protocol, event by event.
 - `docs/DESIGN.md` - why it is split this way, and what went wrong first.
 - `docs/RUNTIMES.md` - how each runtime is supported, and what each one
