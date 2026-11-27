@@ -669,7 +669,7 @@ fn repo_infos(repos: &[String]) -> Vec<(String, Option<RepoInfo>)> {
 /// The shape is the thing that decides, so every candidate has to be asked.
 /// One request at a time takes a minute for a big search, which is long
 /// enough to look like a hang.
-fn shapes_of(candidates: &[String], exists: &[String], target: &Signature) -> Vec<(String, Shape)> {
+fn shapes_of(candidates: &[String], exists: &[String]) -> Vec<(String, Shape)> {
     let workers = std::thread::available_parallelism()
         .map(|n| n.get().min(4))
         .unwrap_or(2)
@@ -680,7 +680,6 @@ fn shapes_of(candidates: &[String], exists: &[String], target: &Signature) -> Ve
         let mut handles = Vec::new();
         for part in candidates.chunks(chunk.max(1)) {
             let exists: Vec<String> = exists.to_vec();
-            let target = target.clone();
             handles.push(scope.spawn(move || {
                 part.iter()
                     .map(|repo| {
@@ -725,7 +724,7 @@ pub fn find_donor(target: &Signature, spec: &str, hint: &Hint) -> Donor {
     // There are more candidates than there is patience, so they are asked in
     // parallel - but the order is kept, so the best candidate is still the
     // first one tried.
-    let shapes = shapes_of(&candidates, &exists, target);
+    let shapes = shapes_of(&candidates, &exists);
     for (repo, shape) in shapes {
         match shape {
             Shape::Known(signature) => {

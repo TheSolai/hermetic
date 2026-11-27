@@ -231,6 +231,24 @@ uv pip install --python .venv/bin/python -e ./heretic
 ./target/release/hermetic --no-panel
 ```
 
+### Builds
+
+The first time a model shape is loaded, HERMETIC finds the original weights,
+runs Heretic over them, and keeps the adapter. That is the slow part: the
+weights are downloaded, and the optimisation runs over every layer. The second
+time that shape is loaded, the adapter is already there and the model is
+served immediately.
+
+The adapter cache lives in `~/.hermetic` - `adapters/` for the adapters,
+`models/` for the weights they bind to, `builds/` and `study/` for the work in
+progress.
+
+Builds use `profiles/standard.toml`, which is upstream Heretic's own
+configuration with the number of trials brought down from a hundred to
+twenty. `HERMETIC_PROFILE=fast-test.toml` makes a build much faster and much
+weaker - it is for proving the pipeline works, not for a model you want to
+talk to.
+
 ## Keys
 
 | Key | What it does |

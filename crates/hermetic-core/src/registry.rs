@@ -121,6 +121,16 @@ impl Registry {
 
         let key = sig.key();
         let build_dir = self.builds_dir().join(&key);
+
+        // If the optimiser has already run for this shape, its PEFT adapter
+        // is still there, and running Heretic again would throw it away and
+        // spend hours making the same answer. So it is kept, and the build
+        // goes straight to the conversion.
+        if build_dir.join("adapter_model.safetensors").exists() {
+            println!("  reusing the adapter the optimiser already produced");
+            return Ok(build_dir);
+        }
+
         let _ = std::fs::remove_dir_all(&build_dir);
         std::fs::create_dir_all(&build_dir)?;
 
