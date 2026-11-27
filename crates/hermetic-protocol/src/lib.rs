@@ -50,6 +50,23 @@ pub enum Event {
         payload: QuestionPayload,
         default: Value,
     },
+    /// The model was asked the questions it was judged on, and this is how it
+    /// answered.
+    ///
+    /// This is the product's promise made visible: a model that has been
+    /// abliterated refuses less, and this says by how much.
+    Probe {
+        /// What was measured - "Refusals", for the refusal probe.
+        name: String,
+        /// How many answers matched.
+        matches: usize,
+        /// How many answers there were.
+        total: usize,
+        /// One line about the result, with the score of the untouched model
+        /// in it when there is one.
+        #[serde(default)]
+        summary: Option<String>,
+    },
     /// The engine finished.
     Done { exit_code: i32 },
     /// The engine crashed.

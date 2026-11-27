@@ -154,6 +154,121 @@ fn truncate(text: &str, width: usize) -> String {
     out
 }
 
+/// The questions a model is judged on, and what a refusal looks like.
+///
+/// This is written next to the build by the bridge, which takes them from
+/// the scorer upstream judged the model with. They are upstream's own
+/// questions, and upstream's own markers.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct Probe {
+    name: String,
+    markers: Vec<String>,
+    prompts: Vec<ProbePrompt>,
+    /// How often the untouched model refused the same questions.
+    #[serde(default)]
+    baseline: Option<f64>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ProbePrompt {
+    #[serde(default)]
+    system: String,
+    user: String,
+}
+
+/// What the probe found.
+struct ProbeResult {
+    matches: usize,
+    total: usize,
+}
+
+/// One line about what the probe found.
+///
+/// The number on its own says little: "6 of 16" is only good news next to
+/// "it used to be 99 of 100". So the score of the untouched model comes with
+/// it, when the build measured one.
+fn probe_summary(probe: &Probe, result: &ProbeResult) -> String {
+    let mut summary = format!("{} {}/{}", probe.name, result.matches, result.total);
+    if let Some(baseline) = probe.baseline {
+        summary.push_str(&format!(" · the untouched model refused {:.0}%", baseline * 100.0));
+    }
+    summary
+}
+
+/// The probe for a shape, if the model was built with one.
+fn probe_for(registry: &Registry, signature: &Option<hermetic_core::Signature>) -> Option<Probe> {
+    let signature = signature.as_ref()?;
+    let path = registry.builds_dir().join(signature.key()).join("probe.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    let probe: Probe = serde_json::from_str(&text).ok()?;
+    if probe.prompts.is_empty() || probe.markers.is_empty() {
+        return None;
+    }
+    Some(probe)
+}
+
+/// Ask the model the questions, and count the answers that match.
+fn run_probe(endpoint: &str, model: &str, probe: &Probe) -> ProbeResult {
+    let Ok((host, port)) = hermetic_core::chat::split_endpoint(endpoint) else {
+        return ProbeResult {
+            matches: 0,
+            total: 0,
+        };
+    };
+
+    let mut matches = 0;
+    let mut total = 0;
+    for prompt in &probe.prompts {
+        let mut messages = Vec::new();
+        if !prompt.system.trim().is_empty() {
+            messages.push(json!({"role": "system", "content": prompt.system}));
+        }
+        messages.push(json!({"role": "user", "content": prompt.user}));
+
+        let body = json!({
+            "model": model,
+            "messages": messages,
+            "max_tokens": 96,
+            "temperature": 0.0,
+            "stream": false,
+        });
+        let Ok(answer) = hermetic_core::http::post_json(&host, port, "/v1/chat/completions", &body)
+        else {
+            continue;
+        };
+        let text = answer
+            .pointer("/choices/0/message/content")
+            .and_then(|c| c.as_str())
+            .unwrap_or_default();
+        total += 1;
+        if is_refusal(text, &probe.markers) {
+            matches += 1;
+        }
+    }
+
+    ProbeResult { matches, total }
+}
+
+/// Does this answer look like a refusal?
+///
+/// The same rule upstream uses: an empty answer counts as a refusal, the
+/// text is lowercased, emphasis is removed, typographic apostrophes are
+/// normalised and whitespace is collapsed - and then any marker in it means
+/// a refusal.
+fn is_refusal(response: &str, markers: &[String]) -> bool {
+    if response.trim().is_empty() {
+        return true;
+    }
+    let text = response
+        .to_lowercase()
+        .replace('*', "")
+        .replace('\u{2019}', "'")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    markers.iter().any(|marker| text.contains(&marker.to_lowercase()))
+}
+
 /// Load a model and talk to it.
 fn run(spec_arg: &str) -> Result<()> {
     let source =
@@ -226,6 +341,37 @@ fn run(spec_arg: &str) -> Result<()> {
     // the tab can be named after its model.
     announce(&source.label(), &signature, adapter.as_deref(), &handle);
 
+    // Ask the model the questions it was judged on, and report how it did.
+    //
+    // The ablation is judged on a set of prompts and a list of markers, and
+    // that judgement was made on the model being optimised. This asks the
+    // same questions of the model that is *running* - the one with the
+    // adapter bound to it - because that is the model the user is going to
+    // talk to, and it is the only one whose answer means anything.
+    //
+    // It runs in the background: the model is ready to talk to immediately,
+    // and the answer arrives a moment later.
+    let probe = probe_for(&registry, &signature);
+    if let Some(probe) = probe {
+        let endpoint = handle.endpoint.clone();
+        let model = source.label();
+        std::thread::spawn(move || {
+            let result = run_probe(&endpoint, &model, &probe);
+            let summary = probe_summary(&probe, &result);
+            if let Some(socket) = std::env::var_os(SOCKET_ENV) {
+                let event = json!({
+                    "event": "probe",
+                    "name": probe.name,
+                    "matches": result.matches,
+                    "total": result.total,
+                    "summary": summary,
+                });
+                let _ = channel::send_event(&PathBuf::from(socket), &event);
+            }
+            eprintln!("  \x1b[2m{summary}\x1b[0m");
+        });
+    }
+
     // The model has to be stopped when the terminal goes away.
     install_signal_handlers();
     if let Ok(mut guard) = SERVED.try_lock() {
@@ -276,7 +422,49 @@ fn prepare(
     }
 
     let base = weights::weights_for(source, registry);
-    let adapter = registry.adapter_for(signature);
+
+    // An adapter is fitted to the weights it was built on. Two models with
+    // the same shape are not the same model, and the weights say what they
+    // are. When the adapter's donor is not the model these weights are, the
+    // adapter belongs to another model and is not served.
+    let hint = spec::hint_of(source, signature);
+    let donor = registry.donor_of(signature);
+    let donor_fits = match (&donor, &hint.name) {
+        (Some(donor), Some(name)) => hermetic_core::hub::donor_matches_weights(donor, name),
+        _ => true,
+    };
+    if !donor_fits {
+        if let Some(donor) = &donor {
+            println!(
+                "  note      the adapter was made for {donor}, and these weights are not that model"
+            );
+        }
+        println!("            so a new one is built for them");
+    }
+
+    // A study that has run fewer trials than the profile asks for has more
+    // to give, so the adapter next to it is from an earlier, weaker
+    // ablation. It is not served: the optimiser runs again, and it
+    // continues where it left off.
+    let config = hermetic_core::config::Config::load();
+    let wanted = config.profile_trials();
+    let study_pending = registry
+        .study_needs_more_trials(signature, donor.as_deref(), wanted);
+
+    // A GGUF that is older than the adapter next to it is from an older
+    // ablation. It is made again rather than served.
+    let adapter = match registry.adapter_for(signature) {
+        Some(_) if registry.adapter_is_stale(signature) => {
+            println!("  note      the adapter was built again, so it is converted again");
+            None
+        }
+        Some(_) if study_pending => {
+            println!("  note      the study has trials left, so a better adapter is built");
+            None
+        }
+        Some(_) if !donor_fits => None,
+        other => other,
+    };
 
     // A model whose attention output is not square - Gemma 2 and its family
     // - cannot have an adapter bound to it: llama.cpp reshapes that tensor
@@ -303,11 +491,17 @@ fn prepare(
 
     // A model with the adapter folded in, if we have built one.
     if let Some(merged) = registry.merged_for(signature) {
-        println!(
-            "  weights   {} (the adapter is folded in)",
-            merged.display()
-        );
-        return Ok((Some(merged), None, true));
+        if registry.merged_is_stale(signature) {
+            println!("  note      the adapter was built again, so the model is folded again");
+        } else if study_pending {
+            println!("  note      the study has trials left, so a better model is built");
+        } else {
+            println!(
+                "  weights   {} (the adapter is folded in)",
+                merged.display()
+            );
+            return Ok((Some(merged), None, true));
+        }
     }
 
     // Something is missing: build it.
@@ -327,12 +521,64 @@ fn build(
     // model it was made for, so the hub does not have to be asked again - and
     // asking the hub is the slow part, the thing that makes a screen look
     // stuck.
+    //
+    // The PEFT adapter is the expensive part and the GGUF is made from it in
+    // a minute, so when it is there it is converted again rather than run
+    // through the optimiser: the model does not have to be loaded, and the
+    // baseline does not have to be measured again.
     if let Some(donor) = registry.donor_of(signature) {
-        if registry.peft_adapter_for(signature).is_some() {
-            println!("  reusing   the adapter an earlier build made for {donor}");
-            println!("            the optimiser has already done its work, so this only");
-            println!("            converts it and starts the server");
-            return build_with(signature, registry, &[donor], base, fold);
+        let hint = spec::hint_of(source, signature);
+        let donor_fits = match &hint.name {
+            Some(name) => hermetic_core::hub::donor_matches_weights(&donor, name),
+            None => true,
+        };
+        if !donor_fits {
+            // The adapter next to the study was fitted to other weights. It
+            // is not reused, and neither is its donor: the hub is asked
+            // again, and it finds the model these weights actually are.
+            println!(
+                "  note      the adapter on file was made for {donor}, which is not this model"
+            );
+        } else if let Some(peft) = registry.peft_adapter_for(signature) {
+            let config = hermetic_core::config::Config::load();
+            let wanted = config.profile_trials();
+            let run = registry.study_needs_more_trials(signature, Some(&donor), wanted);
+            if run {
+                // The study has trials left to run, so the adapter next to it
+                // is from an earlier, weaker ablation. It is not taken as
+                // final: the optimiser is run again, and it continues where
+                // it left off. The donor is known, so the hub is not asked.
+                println!("  note      the study has trials left, so the optimiser runs again");
+                return build_with(signature, registry, &[donor], base, fold);
+            } else {
+                let build_dir = peft.parent().unwrap_or(Path::new("."));
+                println!("  reusing   the adapter an earlier build made for {donor}");
+                println!("            the optimiser has already done its work, so this only");
+                println!("            converts it and starts the server");
+                let converted = registry.convert_adapter(
+                    signature,
+                    &donor,
+                    build_dir,
+                    &config.python,
+                    &config.llama_cpp_dir,
+                )?;
+                match base.clone().filter(|_| !fold) {
+                    Some(base) => return Ok((Some(base), Some(converted), false)),
+                    None => {
+                        // There is no GGUF of this shape, so the adapter is
+                        // folded into the donor's weights instead.
+                        let merged = registry.merge_adapter(
+                            signature,
+                            &donor,
+                            build_dir,
+                            &config.python,
+                            &config.bridge_dir(),
+                            &config.llama_cpp_dir,
+                        )?;
+                        return Ok((Some(merged), None, true));
+                    }
+                }
+            }
         }
     }
 
@@ -401,6 +647,7 @@ fn build_with(
                     &config.bridge_dir(),
                     &config.llama_cpp_dir,
                     socket.as_deref(),
+                    config.profile_trials(),
                 )
                 .map(|built| (Some(base), Some(built), false)),
             // There is no GGUF of this shape, so the merged build is the
@@ -415,6 +662,7 @@ fn build_with(
                     &config.bridge_dir(),
                     &config.llama_cpp_dir,
                     socket.as_deref(),
+                    config.profile_trials(),
                 )
                 .map(|merged| (Some(merged), None, true)),
         };

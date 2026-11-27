@@ -24,6 +24,8 @@ pub struct Tab {
     pub shape: Option<String>,
     pub adapter: Option<String>,
     pub endpoint: Option<String>,
+    /// What the probe found: "Refusals 2/16".
+    pub probe: Option<String>,
     /// The tab's own number, so the shell can tell the terminal who it is.
     pub number: u64,
 }
@@ -40,6 +42,7 @@ impl Tab {
             shape: None,
             adapter: None,
             endpoint: None,
+            probe: None,
             number,
         }
     }
@@ -130,6 +133,12 @@ pub struct App {
     pub catalogue: Vec<CatalogueEntry>,
     /// Has the catalogue been read yet?
     pub catalogue_loaded: bool,
+    /// Does the catalogue need looking for again?
+    ///
+    /// A build that has finished has changed the machine: there is an adapter
+    /// for that shape now. The panel would go on saying "build" for a model
+    /// that is ready, so the list is looked for again.
+    pub catalogue_stale: bool,
     /// The first model in the list that is shown.
     pub list_scroll: usize,
     /// Is the keyboard driving the model list?
@@ -181,6 +190,7 @@ impl App {
             tab_strip_y: 0,
             catalogue: Vec::new(),
             catalogue_loaded: false,
+            catalogue_stale: false,
             list_scroll: 0,
             list_focus: false,
             list_selected: 0,
@@ -440,6 +450,23 @@ impl App {
                 });
                 self.push_log(format!("? {message}"));
             }
+            Event::Probe {
+                name,
+                matches,
+                total,
+                summary,
+            } => {
+                // The model was asked the questions it was judged on, and
+                // this is how it answered. The panel says so, because a model
+                // that no longer refuses is the whole point of the thing.
+                let note = summary.unwrap_or_else(|| format!("{name} {matches}/{total}"));
+                for tab in self.tabs.iter_mut() {
+                    if tab.probe.is_none() {
+                        tab.probe = Some(note.clone());
+                    }
+                }
+                self.push_log(note);
+            }
             Event::Done { exit_code } => {
                 if let Some(engine) = self.engine_mut(id) {
                     engine.state = if exit_code == 0 {
@@ -449,6 +476,13 @@ impl App {
                     };
                 }
                 self.push_log(format!("engine finished with exit code {exit_code}"));
+                // A build that finished has changed what is on the machine:
+                // there is an adapter for that shape now. The list of models
+                // is looked for again, so the panel does not go on saying
+                // "build" for a model that is ready.
+                if exit_code == 0 {
+                    self.catalogue_stale = true;
+                }
             }
             Event::Error { error } => {
                 if let Some(engine) = self.engine_mut(id) {

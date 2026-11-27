@@ -104,8 +104,43 @@ When Ollama stores a model as safetensors and no GGUF of that shape is
 cached, the terminal says so rather than pretending: llama.cpp cannot read
 safetensors.
 
-## Which trial is kept
+## The adapter has to be fitted to the weights being served
 
+Two models with the same shape are not the same model. A base model and its
+instruction tuned version have the same architecture, the same number of
+layers and the same width - and different refusal directions. An adapter
+fitted to one of them does nothing for the other, or worse.
+
+So the donor has to be the model the weights actually are. The weights say
+what they are, in their own name: a GGUF file calls itself `Qwen2.5 0.5B
+Instruct`, and that is a truer statement than the name it was downloaded
+under.
+
+That is not enough on its own, because the hub search can go wrong: an
+adapter built earlier, for the base model, sits next to the study and is
+reused, because reusing it is much cheaper than asking the hub again. So the
+adapter's donor is compared with the weights' name, and when they disagree
+the adapter is not served and the donor is not trusted either - the hub is
+asked again, and it finds the model the weights really are.
+
+The same rule applies to the study: a study belongs to the model it was run
+on, and only the journal of *this* donor counts.
+
+## The model is asked whether it still refuses
+
+A model that has been abliterated is supposed to refuse less, and the
+terminal is the only place where that can be shown.
+
+So after a model is served, it is asked the questions it was judged on - the
+prompts and the markers come from the scorer upstream used, and they are
+written next to the build - and the answers are counted. The score of the
+untouched model goes with them, because "6 of 16" is only good news next to
+"it used to be 99 of 100".
+
+The probe runs in the background: the model is ready to talk to at once, and
+the answer arrives a moment later.
+
+## Which trial is kept
 Heretic optimises an ablation: it tries a number of ways to remove a model's
 refusals, scores each one, and keeps the best. "Best" is not obvious.
 

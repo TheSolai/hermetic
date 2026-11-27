@@ -104,6 +104,65 @@ impl Registry {
         (!base.is_empty()).then(|| base.to_string())
     }
 
+    /// Does the study for a shape still have trials to run?
+    ///
+    /// The number the profile asks for is what it wants; the number the
+    /// study has run is what it has. When the first is bigger than the
+    /// second, the optimiser has more to do, and the adapter next to the
+    /// study is from an earlier, weaker ablation.
+    pub fn study_needs_more_trials(
+        &self,
+        sig: &Signature,
+        donor: Option<&str>,
+        wanted: Option<usize>,
+    ) -> bool {
+        match wanted {
+            Some(wanted) => self.study_trial_count(sig, donor) < wanted,
+            None => false,
+        }
+    }
+
+    /// How many trials has the study for a shape run?
+    ///
+    /// A study that has run fewer trials than the profile asks for has more
+    /// to give: the adapter next to it is from an earlier, weaker ablation.
+    pub fn study_trial_count(&self, sig: &Signature, donor: Option<&str>) -> usize {
+        let dir = self.study_dir().join(sig.key());
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return 0;
+        };
+        // A study belongs to the model it was run on, and upstream names its
+        // journal after that model. Two donors for the same shape are two
+        // studies, and only the one for this donor counts.
+        let wanted = donor.map(study_file_name);
+        let mut trials = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Some(wanted) = &wanted {
+                if path.file_name().and_then(|n| n.to_str()) != Some(wanted.as_str()) {
+                    continue;
+                }
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for line in text.lines() {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                // In Optuna's journal, operation 4 is the one that starts a
+                // trial; 5 sets its parameters and 6 completes it.
+                if value.get("op_code").and_then(|c| c.as_u64()) == Some(4) {
+                    trials += 1;
+                }
+            }
+        }
+        trials
+    }
+
     /// Put a GGUF into the cache under a shape.
     ///
     /// A hard link is tried first: the weights are usually large, and Ollama's
@@ -141,6 +200,7 @@ impl Registry {
         python: &Path,
         bridge_dir: &Path,
         socket: Option<&Path>,
+        wanted: Option<usize>,
     ) -> Result<PathBuf> {
         let _ = std::fs::create_dir_all(self.builds_dir());
         let _ = std::fs::create_dir_all(self.study_dir());
@@ -152,7 +212,13 @@ impl Registry {
         // is still there, and running Heretic again would throw it away and
         // spend hours making the same answer. So it is kept, and the build
         // goes straight to the conversion.
-        if build_dir.join("adapter_model.safetensors").exists() {
+        //
+        // Unless the study has trials left to run. An adapter from a study
+        // of one trial is a weaker ablation than the profile asks for, and
+        // the optimiser is run again to finish it.
+        if build_dir.join("adapter_model.safetensors").exists()
+            && !self.study_needs_more_trials(sig, Some(donor), wanted)
+        {
             println!("  reusing the adapter the optimiser already produced");
             return Ok(build_dir);
         }
@@ -259,9 +325,9 @@ impl Registry {
         bridge_dir: &Path,
         llama_cpp: &Path,
         socket: Option<&Path>,
+        wanted: Option<usize>,
     ) -> Result<PathBuf> {
         let _ = std::fs::create_dir_all(self.adapters_dir());
-        let key = sig.key();
         let build_dir = self.run_heretic(
             sig,
             donor,
@@ -269,9 +335,57 @@ impl Registry {
             python,
             bridge_dir,
             socket,
+            wanted,
         )?;
 
         // Convert the PEFT adapter to GGUF.
+        self.convert_adapter(sig, donor, &build_dir, python, llama_cpp)
+    }
+
+    /// Is the GGUF adapter older than the PEFT adapter it was made from?
+    ///
+    /// The PEFT adapter is the expensive part and the GGUF is made from it in
+    /// a minute, so when the PEFT adapter is the newer of the two, the GGUF
+    /// is from an older ablation and has to be made again. Without this, a
+    /// rebuilt adapter is silently ignored and the old one is served.
+    pub fn adapter_is_stale(&self, sig: &Signature) -> bool {
+        self.gguf_is_stale(sig, self.adapter_for(sig))
+    }
+
+    /// Is the model with the adapter folded in older than the adapter?
+    pub fn merged_is_stale(&self, sig: &Signature) -> bool {
+        self.gguf_is_stale(sig, self.merged_for(sig))
+    }
+
+    fn gguf_is_stale(&self, sig: &Signature, gguf: Option<PathBuf>) -> bool {
+        let (Some(peft), Some(gguf)) = (self.peft_adapter_for(sig), gguf) else {
+            return false;
+        };
+        let (Ok(peft_time), Ok(gguf_time)) = (
+            peft.metadata().and_then(|m| m.modified()),
+            gguf.metadata().and_then(|m| m.modified()),
+        ) else {
+            return false;
+        };
+        peft_time > gguf_time
+    }
+
+    /// Convert a PEFT adapter into the GGUF that llama.cpp binds.
+    ///
+    /// This needs the optimiser's output and nothing else, so it is the
+    /// cheap way back to a servable adapter: the model does not have to be
+    /// loaded, and the baseline does not have to be measured again.
+    pub fn convert_adapter(
+        &self,
+        sig: &Signature,
+        donor: &str,
+        build_dir: &Path,
+        python: &Path,
+        llama_cpp: &Path,
+    ) -> Result<PathBuf> {
+        let _ = std::fs::create_dir_all(self.adapters_dir());
+        let key = sig.key();
+
         let converter = llama_cpp.join("convert_lora_to_gguf.py");
         let out_file = self.adapters_dir().join(format!("{key}.gguf"));
         let _ = std::fs::remove_file(&out_file);
@@ -280,7 +394,7 @@ impl Registry {
             .current_dir(llama_cpp)
             .env("PYTHONPATH", llama_cpp.join("gguf-py"))
             .arg(&converter)
-            .arg(&build_dir)
+            .arg(build_dir)
             .arg("--base-model-id")
             .arg(donor)
             .arg("--outfile")
@@ -318,6 +432,7 @@ impl Registry {
         bridge_dir: &Path,
         llama_cpp: &Path,
         socket: Option<&Path>,
+        wanted: Option<usize>,
     ) -> Result<PathBuf> {
         let _ = std::fs::create_dir_all(self.merged_dir());
         let key = sig.key();
@@ -338,10 +453,35 @@ impl Registry {
                 python,
                 bridge_dir,
                 socket,
+                wanted,
             )?
         };
 
         // 2. Fold the adapter into the weights.
+        // 3. Convert the merged weights to GGUF.
+        self.merge_adapter(sig, donor, &build_dir, python, bridge_dir, llama_cpp)
+    }
+
+    /// Fold a PEFT adapter into a model's weights, and convert the result.
+    ///
+    /// This is the way out when a LoRA cannot be used: an architecture
+    /// llama.cpp will not bind a LoRA to, or a model that has no GGUF of its
+    /// own. The adapter is merged into the donor's weights, and the result
+    /// is an ordinary GGUF.
+    ///
+    /// Like the conversion, it needs the optimiser's output and nothing
+    /// else, so it does not load the model and does not measure the
+    /// baseline again.
+    pub fn merge_adapter(
+        &self,
+        sig: &Signature,
+        donor: &str,
+        build_dir: &Path,
+        python: &Path,
+        bridge_dir: &Path,
+        llama_cpp: &Path,
+    ) -> Result<PathBuf> {
+        let key = sig.key();
         let merged_dir = build_dir.join("merged");
         let merger = bridge_dir.join("scripts").join("merge_adapter.py");
         let merge = Command::new(python)
@@ -350,7 +490,7 @@ impl Registry {
             .arg("--base")
             .arg(donor)
             .arg("--adapter")
-            .arg(&build_dir)
+            .arg(build_dir)
             .arg("--out")
             .arg(&merged_dir)
             .stdin(Stdio::null())
@@ -362,7 +502,6 @@ impl Registry {
             anyhow::bail!("could not merge the adapter into {donor}");
         }
 
-        // 3. Convert the merged weights to GGUF.
         let converter = llama_cpp.join("convert_hf_to_gguf.py");
         let out_file = self.merged_dir().join(format!("{key}.gguf"));
         let _ = std::fs::remove_file(&out_file);
@@ -391,6 +530,24 @@ impl Registry {
 
         Ok(out_file)
     }
+}
+
+/// The name of the journal a study is kept in.
+///
+/// Upstream names it after the model it was run on, with everything that is
+/// not a letter, a digit, an underscore or a dash turned into two dashes.
+/// The name is the same here, so the right journal is found.
+fn study_file_name(donor: &str) -> String {
+    let mut out = String::new();
+    for c in donor.chars() {
+        if c.is_alphanumeric() || c == '_' || c == '-' {
+            out.push(c);
+        } else {
+            out.push_str("--");
+        }
+    }
+    out.push_str(".jsonl");
+    out
 }
 
 /// A free TCP port on the loopback interface.

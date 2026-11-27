@@ -22,6 +22,7 @@ path = "src/bin/hermetic-shim.rs"
 hermetic-core = { path = "../hermetic-core" }
 hermetic-protocol = { path = "../hermetic-protocol" }
 anyhow.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"

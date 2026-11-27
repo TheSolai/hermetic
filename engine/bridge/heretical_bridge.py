@@ -437,6 +437,7 @@ def install() -> None:
 
     def get_scores(self: Any, *a: Any, **k: Any) -> Any:
         result = _get_scores(self, *a, **k)
+        _capture_probe(self)
         emit(
             "scores",
             phase="trial",
@@ -446,6 +447,7 @@ def install() -> None:
 
     def get_baseline_scores(self: Any, *a: Any, **k: Any) -> Any:
         result = _get_baseline(self, *a, **k)
+        _capture_probe(self, result)
         emit(
             "scores",
             phase="baseline",
@@ -555,18 +557,99 @@ def _install_settings_seam(settings_cls: Any = None) -> None:
         return
 
     def model_validate_init_only(cls: Any, values: Any, current: Any) -> Any:
-        if isinstance(values, dict) and values.get("trial_index") is not None:
-            # The pin belongs to the run that asked for it, not to the study.
-            # Upstream restores the study's settings over the command line,
-            # so the pin has to be carried over explicitly.
-            values = dict(values)
+        if not isinstance(values, dict):
+            return original.__func__(cls, values, current)
+
+        values = dict(values)
+
+        # The trial to keep belongs to the run that asked for it, not to the
+        # study. Upstream restores the study's settings over the command
+        # line, so the pin has to be carried over explicitly.
+        if values.get("trial_index") is not None:
             values["trial_index"] = getattr(current, "trial_index", None)
+
+        # How much work to do belongs to the profile, not to the study. A
+        # study made when the profile asked for one trial and resumed under a
+        # profile that asks for twenty is a study that has one trial and
+        # needs nineteen more - not a study that is finished.
+        for field in ("n_trials", "n_startup_trials"):
+            wanted = getattr(current, field, None)
+            if wanted is not None:
+                values[field] = wanted
+
         return original.__func__(cls, values, current)
 
     model_validate_init_only._hermetic_patched = True  # type: ignore[attr-defined]
     settings_cls.model_validate_init_only = classmethod(  # type: ignore[method-assign]
         model_validate_init_only
     )
+
+
+#: How many questions the probe asks.
+PROBE_SIZE = 16
+
+#: Where the build is being saved, so the probe can be written next to it.
+SAVE_DIRECTORY: Path | None = None
+
+#: Whether the probe has already been written.
+_PROBE_WRITTEN = False
+
+
+def _capture_probe(evaluator: Any, scores: Any = None) -> None:
+    """Write down the questions the model is judged on, and the markers.
+
+    Upstream judges a model on a set of prompts and a list of markers: for
+    refusals, a hundred questions and thirty-three phrases that give a
+    refusal away. Those are the questions that decide whether the ablation
+    worked, and they are the questions worth asking the *served* model
+    afterwards - the one that is actually running, with the adapter bound to
+    it.
+
+    So they are written next to the build, and the client asks them.
+
+    The score of the untouched model goes with them. A number on its own
+    says little: "6 of 16" is only good news next to "it used to be 99 of
+    100".
+    """
+    global _PROBE_WRITTEN
+
+    if _PROBE_WRITTEN or SAVE_DIRECTORY is None:
+        return
+
+    for entry in getattr(evaluator, "_scorer_entries", []) or []:
+        scorer = getattr(entry, "scorer", None)
+        prompts = getattr(scorer, "prompts", None)
+        markers = getattr(getattr(scorer, "settings", None), "keyword_markers", None)
+        if not prompts or not markers:
+            continue
+
+        name = str(getattr(scorer, "score_name", "Refusals"))
+        baseline = None
+        for score_name, score in scores or []:
+            if str(score_name) == name:
+                baseline = float(getattr(score, "value", 0.0))
+                break
+
+        probe = {
+            "name": name,
+            "markers": [str(m) for m in markers],
+            "prompts": [
+                {
+                    "system": str(getattr(p, "system", "") or ""),
+                    "user": str(getattr(p, "user", "") or ""),
+                }
+                for p in list(prompts)[:PROBE_SIZE]
+            ],
+            "baseline": baseline,
+        }
+        try:
+            path = SAVE_DIRECTORY / "probe.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(probe, indent=1), encoding="utf-8")
+            _PROBE_WRITTEN = True
+        except Exception:
+            pass
+        return
 
 
 def _install_trust_seam() -> None:
@@ -700,6 +783,12 @@ def main() -> int:
         help="what the client should call this run, e.g. the model being worked on",
     )
     known, rest = parser.parse_known_args()
+
+    global SAVE_DIRECTORY
+    for index, item in enumerate(rest):
+        if item == "--save-directory" and index + 1 < len(rest):
+            SAVE_DIRECTORY = Path(rest[index + 1])
+            break
 
     global CHANNEL
     CHANNEL = Channel(

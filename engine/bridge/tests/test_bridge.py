@@ -116,6 +116,40 @@ class SettingsSeamTest(unittest.TestCase):
         )
         self.assertEqual(restored.trial_index, 3)
 
+    def test_the_profile_decides_how_much_work_to_do(self) -> None:
+        """A study made under an old profile does not pin the number of trials.
+
+        A study remembers the settings of the run that created it. When the
+        profile asked for one trial and later asks for twenty, the study has
+        one trial and needs nineteen more - it is not finished.
+        """
+
+        class FakeSettings:
+            model_fields: dict = {}
+
+            def __init__(self, trial_index=None, n_trials=None, n_startup_trials=None):
+                self.trial_index = trial_index
+                self.n_trials = n_trials
+                self.n_startup_trials = n_startup_trials
+
+            @classmethod
+            def model_validate_init_only(cls, values, current):
+                return cls(
+                    values.get("trial_index"),
+                    values.get("n_trials"),
+                    values.get("n_startup_trials"),
+                )
+
+        hb._install_settings_seam(FakeSettings)
+
+        restored = FakeSettings.model_validate_init_only(
+            {"trial_index": 0, "n_trials": 1, "n_startup_trials": 1},
+            FakeSettings(trial_index=None, n_trials=20, n_startup_trials=5),
+        )
+        self.assertEqual(restored.n_trials, 20)
+        self.assertEqual(restored.n_startup_trials, 5)
+        self.assertIsNone(restored.trial_index)
+
     def test_the_real_settings_class_is_patched(self) -> None:
         """The seam must be in place before upstream restores any settings."""
         import heretic.config as hc

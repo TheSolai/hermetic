@@ -41,6 +41,33 @@ impl Config {
             .unwrap_or_else(|| PathBuf::from("profiles/standard.toml"))
     }
 
+    /// How many trials the profile asks for.
+    ///
+    /// The profile is upstream Heretic's own configuration file, and it says
+    /// how many trials to run. That number is what says whether an adapter
+    /// is the best the optimiser can do: a study with fewer trials than the
+    /// profile asks for has more to give, and the adapter next to it is from
+    /// an earlier, weaker ablation.
+    ///
+    /// Only one key is read, and it is read plainly. When the file cannot be
+    /// read, or does not say, `None` is returned - and the caller treats that
+    /// as "ask the optimiser", which is the safe direction.
+    pub fn profile_trials(&self) -> Option<usize> {
+        let text = std::fs::read_to_string(self.profile()).ok()?;
+        for line in text.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("n_trials") else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            let Some(rest) = rest.strip_prefix('=') else {
+                continue;
+            };
+            return rest.trim().parse::<usize>().ok();
+        }
+        None
+    }
+
     /// Read the configuration.
     pub fn load() -> Config {
         if let Some(dir) = std::env::var_os("HERMETIC_ENGINE_DIR") {

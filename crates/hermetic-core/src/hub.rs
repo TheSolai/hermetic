@@ -533,6 +533,41 @@ const ROLE_WORDS: &[&str] = &[
     "hf",
 ];
 
+/// Is a donor the model these weights actually are?
+///
+/// An adapter is fitted to the weights it was built on. Two models with the
+/// same shape are not the same model - a base model and its instruction
+/// tuned version have the same shape and different refusal directions - and
+/// an adapter fitted to one of them does nothing for the other, or worse.
+///
+/// The weights say what they are, in their own name. The donor says what it
+/// is, in its repository name. When the weights carry a word the donor does
+/// not have - `Instruct` where the donor is plain `Qwen2.5-0.5B` - they are
+/// different models, and the adapter belongs to the other one.
+pub fn donor_matches_weights(donor: &str, weights_name: &str) -> bool {
+    let donor = donor.rsplit('/').next().unwrap_or(donor);
+    let donor_tokens: Vec<String> = tokens(donor);
+    let weight_tokens: Vec<String> = tokens(weights_name);
+
+    for token in &weight_tokens {
+        if !ROLE_WORDS.contains(&token.to_lowercase().as_str()) {
+            continue;
+        }
+        if !donor_tokens.iter().any(|t| t == token) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The words of a name, lowercased and without the punctuation.
+fn tokens(name: &str) -> Vec<String> {
+    name.split(|c: char| !c.is_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_lowercase())
+        .collect()
+}
+
 /// The families an architecture is published under.
 ///
 /// llama.cpp calls every Llama model `llama`, but the hub has `Llama-2`,
@@ -991,6 +1026,50 @@ pub fn config_of(repo: &str) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn a_donor_that_is_not_the_weights_is_not_a_match() {
+        // The weights say they are the instruction tuned model; the donor is
+        // the base model. Same shape, different weights.
+        assert!(!donor_matches_weights(
+            "Qwen/Qwen2.5-0.5B",
+            "Qwen2.5 0.5B Instruct"
+        ));
+        assert!(donor_matches_weights(
+            "Qwen/Qwen2.5-0.5B-Instruct",
+            "Qwen2.5 0.5B Instruct"
+        ));
+    }
+
+    #[test]
+    fn the_same_model_under_two_names_is_a_match() {
+        // The weights of a distillation name the model they are.
+        assert!(donor_matches_weights(
+            "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
+            "DeepSeek R1 0528 Qwen3 8B"
+        ));
+        // The organisation in front of the name does not matter.
+        assert!(donor_matches_weights(
+            "unsloth/Qwen2.5-0.5B-Instruct",
+            "Qwen2.5 0.5B Instruct"
+        ));
+        // A quantisation suffix does not change what the weights are.
+        assert!(donor_matches_weights(
+            "Qwen/Qwen2.5-0.5B-Instruct",
+            "Qwen2.5 0.5B Instruct Q4_K_M"
+        ));
+    }
+
+    #[test]
+    fn a_role_word_that_both_names_have_is_no_difference() {
+        // `coder` is a role, and both names carry it.
+        assert!(donor_matches_weights(
+            "Qwen/Qwen2.5-Coder-7B-Instruct",
+            "Qwen2.5 Coder 7B Instruct"
+        ));
+    }
+
     use super::*;
 
     #[test]

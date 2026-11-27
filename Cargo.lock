@@ -322,6 +322,7 @@ dependencies = [
  "libc",
  "portable-pty",
  "ratatui",
+ "serde",
  "serde_json",
  "vt100",
 ]

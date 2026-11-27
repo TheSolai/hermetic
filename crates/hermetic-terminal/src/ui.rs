@@ -191,6 +191,12 @@ fn draw_panel(frame: &mut Frame, area: Rect, app: &mut App) {
                 shorten(endpoint, width.saturating_sub(10))
             )));
         }
+        if let Some(probe) = &tab.probe {
+            lines.push(detail_line(&format!(
+                "  probe    {}",
+                shorten(probe, width.saturating_sub(10))
+            )));
+        }
         lines.push(Line::from(""));
     }
 
