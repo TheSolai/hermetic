@@ -77,8 +77,55 @@ def main() -> int:
     except Exception as error:  # noqa: BLE001 - the tokenizer is not always needed
         print(f"[merge] no tokenizer saved: {error}", flush=True)
 
+    # The fast tokenizer writes `tokenizer.json` and stops there. Some
+    # converters - Gemma's among them - want the SentencePiece file itself,
+    # and without it the conversion stops with "File not found:
+    # tokenizer.model". So the files the repository carries are copied across.
+    for name in TOKENIZER_FILES:
+        if (out / name).exists():
+            continue
+        source = _tokenizer_file(args.base, name, args.trust_remote_code)
+        if source is None:
+            continue
+        shutil.copy(source, out / name)
+        print(f"[merge] copied {name}", flush=True)
+
     print("[merge] done", flush=True)
     return 0
+
+
+# The files a tokenizer is made of, beyond the ones `save_pretrained` writes.
+TOKENIZER_FILES = (
+    "tokenizer.model",
+    "spiece.model",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "merges.txt",
+    "vocab.json",
+)
+
+
+def _tokenizer_file(base: str, name: str, trust_remote_code: bool):
+    """Find one tokenizer file, in a local directory or in a repository."""
+    local = Path(base)
+    if local.is_dir():
+        candidate = local / name
+        return candidate if candidate.is_file() else None
+
+    try:
+        from huggingface_hub import hf_hub_download
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        return Path(
+            hf_hub_download(
+                repo_id=base,
+                filename=name,
+            )
+        )
+    except Exception as error:  # noqa: BLE001 - the file is simply not there
+        print(f"[merge] no {name}: {error}", flush=True)
+        return None
 
 
 if __name__ == "__main__":

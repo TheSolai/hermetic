@@ -302,6 +302,43 @@ pub fn gguf_name(path: &Path) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Does this model have a rectangular attention output?
+///
+/// Gemma 2 has eight heads of 256 each and a width of 2304, so its
+/// attention output is 2048 wide and 2304 deep - not square. llama.cpp
+/// reshapes such a tensor when it loads the model, into a square one, and
+/// an adapter built for the file's shape no longer fits it: llama.cpp
+/// applies it anyway, the weights are corrupted, and the model answers in
+/// gibberish.
+///
+/// The adapter cannot bind to such a model, so it has to be folded into the
+/// weights instead. This is how that is known.
+pub fn has_rectangular_attention(path: &Path) -> bool {
+    let Ok(meta) = gguf_metadata(path) else {
+        return false;
+    };
+    let Some(arch) = meta.get("general.architecture").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let p = format!("{arch}.");
+    let hidden = num(&meta, &format!("{p}embedding_length"));
+    let heads = num(&meta, &format!("{p}attention.head_count"));
+    if hidden == 0 || heads == 0 {
+        return false;
+    }
+    // The head's own width, when the file says. Without it, the width is
+    // the model's, divided by its heads.
+    let key_length = {
+        let key = num(&meta, &format!("{p}attention.key_length"));
+        if key > 0 {
+            key
+        } else {
+            hidden / heads
+        }
+    };
+    heads * key_length != hidden
+}
+
 /// Read only the header — used to skip the tensor directory quickly.
 pub fn header_size(path: &Path) -> Result<u64> {
     let mut f = File::open(path)?;

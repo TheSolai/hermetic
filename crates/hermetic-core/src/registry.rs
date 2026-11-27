@@ -176,10 +176,12 @@ impl Registry {
             .arg(&build_dir)
             .arg("--study-checkpoint-dir")
             .arg(self.study_dir().join(&key))
-            // Pick the first trial and do not ask again: this is a script,
-            // not a conversation.
-            .arg("--trial-index")
-            .arg("0")
+            // The trial to keep is chosen by the engine, which knows the
+            // scores: upstream sorts its Pareto front by the scorers one
+            // after another, so the first trial is the one that refuses not
+            // at all - even when it has moved the model so far that it no
+            // longer speaks. Asking is what lets the better trial be
+            // picked, and the bridge answers.
             .stdin(Stdio::null());
 
         // The profile is upstream Heretic's own configuration file. It is

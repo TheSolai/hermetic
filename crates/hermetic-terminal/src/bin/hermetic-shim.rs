@@ -278,11 +278,27 @@ fn prepare(
     let base = weights::weights_for(source, registry);
     let adapter = registry.adapter_for(signature);
 
+    // A model whose attention output is not square - Gemma 2 and its family
+    // - cannot have an adapter bound to it: llama.cpp reshapes that tensor
+    // when it loads the model, and the adapter no longer fits it. The
+    // adapter is folded into the weights instead.
+    let fold = base
+        .as_ref()
+        .map(|path| hermetic_core::gguf::has_rectangular_attention(path))
+        .unwrap_or(false);
+
     // The fast path: the model we have, with the adapter bound to it.
     if let (Some(base), Some(adapter)) = (&base, &adapter) {
-        println!("  weights   {}", base.display());
-        println!("  adapter   {} (ready)", adapter.display());
-        return Ok((Some(base.clone()), Some(adapter.clone()), false));
+        if !fold {
+            println!("  weights   {}", base.display());
+            println!("  adapter   {} (ready)", adapter.display());
+            return Ok((Some(base.clone()), Some(adapter.clone()), false));
+        }
+        println!(
+            "  note      this model has a rectangular attention output, so an adapter"
+        );
+        println!("            cannot be bound to it; the adapter is folded into the");
+        println!("            weights instead");
     }
 
     // A model with the adapter folded in, if we have built one.
@@ -295,7 +311,7 @@ fn prepare(
     }
 
     // Something is missing: build it.
-    build(source, signature, registry, spec_arg, base)
+    build(source, signature, registry, spec_arg, base, fold)
 }
 
 /// Build what is missing: an adapter, or a model with the adapter in it.
@@ -305,6 +321,7 @@ fn build(
     registry: &Registry,
     spec_arg: &str,
     base: Option<PathBuf>,
+    fold: bool,
 ) -> Result<(Option<PathBuf>, Option<PathBuf>, bool)> {
     // An earlier build may have left the PEFT adapter behind. It names the
     // model it was made for, so the hub does not have to be asked again - and
@@ -315,7 +332,7 @@ fn build(
             println!("  reusing   the adapter an earlier build made for {donor}");
             println!("            the optimiser has already done its work, so this only");
             println!("            converts it and starts the server");
-            return build_with(signature, registry, &[donor], base);
+            return build_with(signature, registry, &[donor], base, fold);
         }
     }
 
@@ -350,7 +367,7 @@ fn build(
     // one is tried.
     let mut donors = vec![repo];
     donors.extend(donor.alternatives.clone());
-    build_with(signature, registry, &donors, base)
+    build_with(signature, registry, &donors, base, fold)
 }
 
 /// Build with a list of donors, best first.
@@ -362,6 +379,7 @@ fn build_with(
     registry: &Registry,
     donors: &[String],
     base: Option<PathBuf>,
+    fold: bool,
 ) -> Result<(Option<PathBuf>, Option<PathBuf>, bool)> {
     let config = hermetic_core::config::Config::load();
     let socket = std::env::var_os(SOCKET_ENV).map(PathBuf::from);
@@ -373,7 +391,7 @@ fn build_with(
         println!("            layer of them - for a large model that is many hours and tens");
         println!("            of gigabytes. Ctrl-C stops it; the panel shows the progress");
 
-        let attempt = match base.clone() {
+        let attempt = match base.clone().filter(|_| !fold) {
             Some(base) => registry
                 .build(
                     signature,

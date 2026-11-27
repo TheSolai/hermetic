@@ -169,6 +169,33 @@ def _trial_summary(value: Any) -> dict[str, Any] | None:
     return summary
 
 
+def _trial_total(value: Any) -> float | None:
+    """The total score of a trial: the sum of its scorers.
+
+    Every scorer is minimised, so the lowest total is the trial that refuses
+    least *and* keeps the model closest to what it was.
+    """
+    user_attrs = getattr(value, "user_attrs", None)
+    if not isinstance(user_attrs, dict):
+        return None
+    scores = user_attrs.get("scores")
+    if not isinstance(scores, list):
+        return None
+    total = 0.0
+    seen = False
+    for score in scores:
+        if not isinstance(score, dict):
+            continue
+        inner = score.get("score")
+        if not isinstance(inner, dict):
+            continue
+        number = inner.get("value")
+        if isinstance(number, (int, float)):
+            total += float(number)
+            seen = True
+    return total if seen else None
+
+
 def _choice_payload(choice: Any) -> dict[str, Any]:
     title = getattr(choice, "title", None)
     value = getattr(choice, "value", None)
@@ -205,6 +232,7 @@ class _Question:
         default: Any,
         objects: list[Any] | None = None,
         server: "QuestionServer | None" = None,
+        best_trial: int | None = None,
     ):
         self.kind = kind
         self.message = message
@@ -212,6 +240,9 @@ class _Question:
         self.default = default
         self.objects = objects or []
         self.server = server
+        # Which of the choices is the trial worth keeping, when the choices
+        # are trials.
+        self.best_trial = best_trial
 
     def ask(self) -> Any:
         return self._resolve()
@@ -241,6 +272,13 @@ class _Question:
             return self.default
         value = answer["answer"]
         if self.kind == "select" and isinstance(value, int):
+            # The client's answer is the first choice, which is the trial
+            # upstream sorts first: the one that refuses not at all, even
+            # when it has moved the model so far that it no longer speaks.
+            # The trial worth keeping is the one with the lowest total
+            # score, and the engine knows which that is.
+            if self.best_trial is not None and value == 0:
+                return self.objects[self.best_trial]
             if 0 <= value < len(self.objects):
                 return self.objects[value]
             return self.default
@@ -279,17 +317,37 @@ class QuestionServer:
         payload = {"choices": rendered}
 
         default: Any = None
+        best_trial: int | None = None
         if objects:
             if self.policy == "first":
                 default = objects[0]
             else:
-                # "auto": prefer a real trial over the "continue" pseudo-choice
+                # "auto": prefer a real trial over the "continue" pseudo-choice.
+                #
+                # And among the trials, the one with the *lowest total score*:
+                # upstream sorts its Pareto front by the scorers one after
+                # another, so the trial that refuses not at all comes first -
+                # even when it has moved the model so far that it no longer
+                # speaks. The sum is the score that means something: refuse
+                # less *and* still be the model.
                 default = objects[0]
-                for obj, r in zip(objects, rendered):
-                    if r.get("trial") is not None:
-                        default = obj
-                        break
-        return _Question("select", message, payload, default, objects, server=self)
+                best_total: float | None = None
+                for index, (obj, r) in enumerate(zip(objects, rendered)):
+                    if r.get("trial") is None:
+                        continue
+                    total = _trial_total(obj)
+                    if total is None:
+                        if best_trial is None:
+                            best_trial = index
+                        continue
+                    if best_total is None or total < best_total:
+                        best_trial = index
+                        best_total = total
+                if best_trial is not None:
+                    default = objects[best_trial]
+        return _Question(
+            "select", message, payload, default, objects, server=self, best_trial=best_trial
+        )
 
     # -- questionary API -------------------------------------------------
     def select(self, message: str, choices: Any = None, **_: Any) -> _Question:
