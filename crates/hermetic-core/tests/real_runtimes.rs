@@ -120,6 +120,67 @@ fn llama_cpp_serves_a_real_model_with_its_adapter() {
 }
 
 #[test]
+#[ignore = "needs llama-server and a model"]
+fn the_server_is_still_running_when_serve_returns() {
+    // The server used to be handed over and dropped in the same breath,
+    // which stopped it: the terminal said "serving" and the model was
+    // already gone. This is the test that says so out loud.
+    let Some((model, _, signature)) = a_model_with_its_adapter() else {
+        eprintln!("no model in the registry - skipping");
+        return;
+    };
+    let runtime = LlamaCppRuntime::new();
+    assert!(runtime.is_available(), "llama-server is on the PATH");
+
+    let mut request = ServeRequest::new(
+        ModelSource::Gguf {
+            path: model.clone(),
+        },
+        signature,
+    );
+    request.weights = Some(model);
+
+    let handle = runtime.serve(&request).expect("the model is served");
+
+    // Give the process a moment to die, if it is going to.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(
+        answers(&handle.endpoint),
+        "the server is still answering at {}",
+        handle.endpoint
+    );
+
+    (handle.stop)();
+}
+
+/// Is the server at this endpoint still answering?
+fn answers(endpoint: &str) -> bool {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let rest = endpoint.trim_start_matches("http://");
+    let host_port = rest.split('/').next().unwrap_or(rest);
+    let Ok(mut addresses) = host_port.to_socket_addrs() else {
+        return false;
+    };
+    let Some(address) = addresses.next() else {
+        return false;
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, std::time::Duration::from_secs(5))
+    else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let request = format!("GET /health HTTP/1.0\r\nHost: {host_port}\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    response.starts_with("HTTP/1.") && response.contains(" 200")
+}
+
+#[test]
 #[ignore = "needs llama-server"]
 fn llama_cpp_serves_a_model_without_an_adapter_too() {
     let Some((model, _, signature)) = a_model_with_its_adapter() else {

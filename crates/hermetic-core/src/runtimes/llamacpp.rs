@@ -22,6 +22,14 @@ use crate::source::ModelSource;
 /// The line llama-server prints when the model is in memory and ready.
 const READY_MARKER: &str = "model loaded";
 
+/// How long the server may say nothing before it is treated as stuck.
+///
+/// A llama-server that is working prints its banner in under a second. One
+/// that has said nothing for this long has not started at all - the GPU is
+/// taken, or the process is wedged - and waiting for it only wastes the
+/// user's time.
+const SILENCE_LIMIT: Duration = Duration::from_secs(45);
+
 /// A running llama-server.
 pub struct Server {
     child: Child,
@@ -108,18 +116,26 @@ impl Server {
     ///
     /// The server answers `/health` before the weights are in memory, so the
     /// only honest signal is the log line it prints when it is done.
+    ///
+    /// A server that says nothing at all is a different thing: it has not
+    /// even started. That happens when the GPU is busy with another model,
+    /// and waiting ten minutes for a line that will never come is what
+    /// makes a screen look stuck.
     pub fn wait_ready(&mut self, timeout: Duration) -> Result<()> {
         let Some(lines) = self.lines.as_ref() else {
             bail!("the server's log is gone");
         };
         let deadline = Instant::now() + timeout;
+        // A healthy server prints its banner in well under a second.
+        let mut silence = Duration::ZERO;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 bail!("llama-server did not finish loading the model in time");
             }
-            match lines.recv_timeout(remaining) {
+            match lines.recv_timeout(remaining.min(SILENCE_LIMIT)) {
                 Ok(line) => {
+                    silence = Duration::ZERO;
                     if line.contains(READY_MARKER) {
                         return Ok(());
                     }
@@ -128,7 +144,17 @@ impl Server {
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    bail!("llama-server did not finish loading the model in time");
+                    silence += SILENCE_LIMIT;
+                    if silence >= SILENCE_LIMIT {
+                        bail!(
+                            "llama-server has said nothing for {} seconds, so it never \
+                             started.\n\
+                             This is usually the GPU: another model is still loaded on it. \
+                             Close the other models and try again.",
+                            SILENCE_LIMIT.as_secs()
+                        );
+                    }
+                    continue;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     match self.child.try_wait() {
@@ -267,11 +293,16 @@ impl ModelRuntime for LlamaCppRuntime {
         });
         // The server is moved into a thread so it lives as long as the
         // handle does, and dies with it.
+        //
+        // It has to be *held*, not dropped: `Server::drop` stops the
+        // process, and `let _ = server` drops it at once. That is what
+        // killed every model this terminal ever served - the screen said
+        // "serving" and the server was already gone.
         std::thread::spawn(move || {
-            let _ = server;
-            loop {
-                std::thread::sleep(Duration::from_secs(3600));
-            }
+            let mut server = server;
+            // Wait for the process to end. The thread then ends, and the
+            // server is dropped, which stops it cleanly.
+            let _ = server.child.wait();
         });
         Ok(handle)
     }

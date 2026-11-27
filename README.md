@@ -243,11 +243,31 @@ The adapter cache lives in `~/.hermetic` - `adapters/` for the adapters,
 `models/` for the weights they bind to, `builds/` and `study/` for the work in
 progress.
 
+A build is never thrown away. Heretic writes its result as a PEFT adapter
+before it is converted to GGUF, and that file is kept: the optimisation is
+hours of work, the conversion is a minute. So a build that was interrupted
+picks up where it left off, and the hub is not asked again - the adapter's own
+configuration says which model it was made for.
+
 Builds use `profiles/standard.toml`, which is upstream Heretic's own
 configuration with the number of trials brought down from a hundred to
-twenty. `HERMETIC_PROFILE=fast-test.toml` makes a build much faster and much
-weaker - it is for proving the pipeline works, not for a model you want to
-talk to.
+twenty. It is handed to the engine the way upstream expects it - through
+`HERETIC_CONFIG_FILE` - so the number of trials, the batch size and the dtypes
+are the ones that were written down. `HERMETIC_PROFILE=fast-test.toml` makes a
+build much faster and much weaker - it is for proving the pipeline works, not
+for a model you want to talk to.
+
+### Repositories that ship their own code
+
+Some models are not in Transformers at all: the repository carries its own
+model code next to the weights, and it has to be executed to load them.
+Transformers asks the person at the keyboard whether that is allowed, and
+when there is no keyboard - as there is not, when the engine runs inside a
+terminal - the model is reported as unloadable.
+
+HERMETIC answers that question in the engine's place, and names the
+repository it is answering about. Set `HERMETIC_TRUST_REMOTE_CODE=0` to refuse
+instead; the model is then reported as unloadable, as it should be.
 
 ## Keys
 

@@ -435,6 +435,8 @@ def install() -> None:
 
     md.load_and_init_modifiers = load_and_init_modifiers  # type: ignore[method-assign]
 
+    _install_trust_seam()
+
     # questionary is imported at module scope by heretic.main and heretic.reproduce
     import heretic.main as hm
 
@@ -444,6 +446,104 @@ def install() -> None:
     for _name, _mod in list(sys.modules.items()):
         if _name.startswith("heretic.") and getattr(_mod, "questionary", None) is not None:
             _mod.questionary = shim  # type: ignore[attr-defined]
+
+
+def _install_trust_seam() -> None:
+    """Answer the "may this repository run its own code?" question with yes.
+
+    Some models ship their own model code: a repository with an ``auto_map``
+    in its config is loaded by executing the Python that sits next to the
+    weights. Transformers asks the person at the keyboard whether that is
+    allowed - and when the answer comes on a terminal that is not there, it
+    fails, and the model is reported as unloadable.
+
+    Upstream Heretic has the same question, asked the same way, and answers
+    it the same way: it keeps a set of trusted repositories and adds one when
+    the user says so. The engine here runs without a conversation, so the
+    answer is given in its place - and the repository is named, so it is not
+    a silent thing.
+
+    Set ``HERMETIC_TRUST_REMOTE_CODE=0`` to refuse instead, and the engine
+    will report the model as unloadable.
+    """
+    import os
+
+    if os.environ.get("HERMETIC_TRUST_REMOTE_CODE", "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return
+
+    try:
+        import importlib
+
+        from transformers import dynamic_module_utils
+    except Exception:
+        return
+
+    original = getattr(dynamic_module_utils, "resolve_trust_remote_code", None)
+    if original is None or getattr(original, "_hermetic_patched", False):
+        return
+
+    def resolve_trust_remote_code(  # type: ignore[no-untyped-def]
+        trust_remote_code: Any,
+        model_name: Any,
+        has_local_code: Any,
+        has_remote_code: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        # Only the repositories that actually ship code are affected, and
+        # only when nobody has said otherwise. An explicit "no" from the
+        # caller is honoured.
+        if (
+            trust_remote_code is None
+            and has_remote_code
+            and not has_local_code
+        ):
+            emit(
+                "log",
+                text=(
+                    f"{model_name} ships its own model code; it is trusted so the "
+                    "model can be loaded"
+                ),
+            )
+            return True
+        return original(
+            trust_remote_code,
+            model_name,
+            has_local_code,
+            has_remote_code,
+            *args,
+            **kwargs,
+        )
+
+    resolve_trust_remote_code._hermetic_patched = True  # type: ignore[attr-defined]
+
+    # Transformers binds this function into a dozen modules with
+    # ``from ... import resolve_trust_remote_code``, so patching one place is
+    # not enough: the binding in each of those modules has to be replaced as
+    # well. They are imported here first, so that a module imported later
+    # binds the patched function in the first place.
+    for module_name in (
+        "transformers.dynamic_module_utils",
+        "transformers.models.auto.auto_factory",
+        "transformers.models.auto.configuration_auto",
+        "transformers.models.auto.image_processing_auto",
+        "transformers.models.auto.video_processing_auto",
+        "transformers.models.auto.processing_auto",
+        "transformers.models.auto.feature_extraction_auto",
+        "transformers.models.auto.tokenization_auto",
+        "transformers.generation.utils",
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        if getattr(module, "resolve_trust_remote_code", None) is not None:
+            module.resolve_trust_remote_code = resolve_trust_remote_code  # type: ignore[attr-defined]
 
 
 def main() -> int:

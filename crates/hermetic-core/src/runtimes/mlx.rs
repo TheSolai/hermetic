@@ -206,11 +206,11 @@ impl ModelRuntime for MlxRuntime {
                 libc::kill(pid, libc::SIGKILL);
             }
         });
+        // The server has to be *held*, not dropped: dropping it stops the
+        // process, and `let _ = server` drops it at once.
         std::thread::spawn(move || {
-            let _ = server;
-            loop {
-                std::thread::sleep(Duration::from_secs(3600));
-            }
+            let mut server = server;
+            let _ = server.child.wait();
         });
         Ok(handle)
     }

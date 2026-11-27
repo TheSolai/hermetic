@@ -77,6 +77,33 @@ impl Registry {
         path.exists().then_some(path)
     }
 
+    /// The PEFT adapter a previous build left behind, if there is one.
+    ///
+    /// Heretic writes its result as a PEFT adapter before it is converted to
+    /// GGUF. That file is the expensive part - hours of optimisation - so it
+    /// is worth more than the GGUF next to it: the GGUF can be made again in
+    /// a minute, the adapter cannot.
+    pub fn peft_adapter_for(&self, sig: &Signature) -> Option<PathBuf> {
+        let path = self
+            .builds_dir()
+            .join(sig.key())
+            .join("adapter_model.safetensors");
+        path.exists().then_some(path)
+    }
+
+    /// The donor a previous build used, if there is one.
+    ///
+    /// The adapter's own config says which model it was made for. That is
+    /// better than asking the hub again: the hub is slow, it rate-limits, and
+    /// the answer it would give is the one already written down.
+    pub fn donor_of(&self, sig: &Signature) -> Option<String> {
+        let path = self.builds_dir().join(sig.key()).join("adapter_config.json");
+        let text = std::fs::read_to_string(path).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let base = value.get("base_model_name_or_path")?.as_str()?.trim();
+        (!base.is_empty()).then(|| base.to_string())
+    }
+
     /// Put a GGUF into the cache under a shape.
     ///
     /// A hard link is tried first: the weights are usually large, and Ollama's
@@ -114,7 +141,6 @@ impl Registry {
         python: &Path,
         bridge_dir: &Path,
         socket: Option<&Path>,
-        trials: u32,
     ) -> Result<PathBuf> {
         let _ = std::fs::create_dir_all(self.builds_dir());
         let _ = std::fs::create_dir_all(self.study_dir());
@@ -142,10 +168,6 @@ impl Registry {
             .arg("heretical_bridge")
             .arg("--model")
             .arg(donor)
-            .arg("--n-trials")
-            .arg(trials.to_string())
-            .arg("--n-startup-trials")
-            .arg("1")
             .arg("--model-action")
             .arg("save")
             .arg("--export-strategy")
@@ -159,6 +181,16 @@ impl Registry {
             .arg("--trial-index")
             .arg("0")
             .stdin(Stdio::null());
+
+        // The profile is upstream Heretic's own configuration file. It is
+        // handed over the way upstream expects - through the environment
+        // variable it reads - so the number of trials, the batch size and
+        // the dtypes are the ones that were written down, and not a number
+        // hardcoded here that would quietly override all of them.
+        let profile = crate::config::Config::load().profile();
+        if profile.is_file() {
+            cmd.env("HERETIC_CONFIG_FILE", &profile);
+        }
 
         if let Some(sock) = socket {
             cmd.env("HERETICAL_CHANNEL_SOCKET", sock);
@@ -225,7 +257,6 @@ impl Registry {
         bridge_dir: &Path,
         llama_cpp: &Path,
         socket: Option<&Path>,
-        trials: u32,
     ) -> Result<PathBuf> {
         let _ = std::fs::create_dir_all(self.adapters_dir());
         let key = sig.key();
@@ -236,7 +267,6 @@ impl Registry {
             python,
             bridge_dir,
             socket,
-            trials,
         )?;
 
         // Convert the PEFT adapter to GGUF.
@@ -286,7 +316,6 @@ impl Registry {
         bridge_dir: &Path,
         llama_cpp: &Path,
         socket: Option<&Path>,
-        trials: u32,
     ) -> Result<PathBuf> {
         let _ = std::fs::create_dir_all(self.merged_dir());
         let key = sig.key();
@@ -307,7 +336,6 @@ impl Registry {
                 python,
                 bridge_dir,
                 socket,
-                trials,
             )?
         };
 
@@ -375,8 +403,70 @@ pub fn free_port() -> Result<u16> {
 mod tests {
     use super::*;
 
+    /// A registry in a temporary directory, so a test never touches the
+    /// real one. The name is unique per test, because tests run at the same
+    /// time and would otherwise share a directory.
+    fn a_registry(name: &str) -> (Registry, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "hermetic-registry-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        (Registry { root: root.clone() }, root)
+    }
+
+    fn a_signature() -> Signature {
+        Signature {
+            arch: "qwen2".into(),
+            layers: 24,
+            hidden: 896,
+            inter: 4864,
+            heads: 14,
+            kv_heads: 2,
+            experts: 0,
+        }
+    }
+
     #[test]
     fn free_ports_are_not_zero() {
         assert_ne!(free_port().unwrap(), 0);
+    }
+
+    #[test]
+    fn an_existing_adapter_names_its_own_donor() {
+        let (registry, root) = a_registry("donor");
+        let signature = a_signature();
+        assert!(registry.donor_of(&signature).is_none());
+
+        let build = registry.builds_dir().join(signature.key());
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(
+            build.join("adapter_config.json"),
+            r#"{"base_model_name_or_path": "Qwen/qwen2.5-0.5b"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            registry.donor_of(&signature).as_deref(),
+            Some("Qwen/qwen2.5-0.5b"),
+            "the donor is remembered, so the hub does not have to be asked again"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_peft_adapter_is_found_where_it_was_left() {
+        let (registry, root) = a_registry("peft");
+        let signature = a_signature();
+        assert!(registry.peft_adapter_for(&signature).is_none());
+
+        let build = registry.builds_dir().join(signature.key());
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(build.join("adapter_model.safetensors"), b"weights").unwrap();
+
+        assert!(registry.peft_adapter_for(&signature).is_some());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

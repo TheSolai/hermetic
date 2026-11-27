@@ -296,6 +296,19 @@ fn build(
     spec_arg: &str,
     base: Option<PathBuf>,
 ) -> Result<(Option<PathBuf>, Option<PathBuf>, bool)> {
+    // An earlier build may have left the PEFT adapter behind. It names the
+    // model it was made for, so the hub does not have to be asked again - and
+    // asking the hub is the slow part, the thing that makes a screen look
+    // stuck.
+    if let Some(donor) = registry.donor_of(signature) {
+        if registry.peft_adapter_for(signature).is_some() {
+            println!("  reusing   the adapter an earlier build made for {donor}");
+            println!("            the optimiser has already done its work, so this only");
+            println!("            converts it and starts the server");
+            return build_with(signature, registry, &[donor], base);
+        }
+    }
+
     let hint = spec::hint_of(source, signature);
     println!("  looking   for the original weights of this shape");
     println!("            the hub is asked for every model with the same shape, and");
@@ -320,9 +333,21 @@ fn build(
     // The repositories with the right shape, best first. A donor can fail -
     // the weights might be in a form Heretic cannot read - and then the next
     // one is tried.
-    let mut donors = vec![repo.clone()];
+    let mut donors = vec![repo];
     donors.extend(donor.alternatives.clone());
+    build_with(signature, registry, &donors, base)
+}
 
+/// Build with a list of donors, best first.
+///
+/// A donor can fail - the weights might be in a form Heretic cannot read -
+/// and then the next one with the same shape is tried.
+fn build_with(
+    signature: &hermetic_core::Signature,
+    registry: &Registry,
+    donors: &[String],
+    base: Option<PathBuf>,
+) -> Result<(Option<PathBuf>, Option<PathBuf>, bool)> {
     let config = hermetic_core::config::Config::load();
     let socket = std::env::var_os(SOCKET_ENV).map(PathBuf::from);
 
@@ -337,13 +362,12 @@ fn build(
             Some(base) => registry
                 .build(
                     signature,
-                    &repo,
+                    repo,
                     &format!("adapter for {repo}"),
                     &config.python,
                     &config.bridge_dir(),
                     &config.llama_cpp_dir,
                     socket.as_deref(),
-                    1,
                 )
                 .map(|built| (Some(base), Some(built), false)),
             // There is no GGUF of this shape, so the merged build is the
@@ -352,13 +376,12 @@ fn build(
             None => registry
                 .build_merged(
                     signature,
-                    &repo,
+                    repo,
                     &format!("merged build of {repo}"),
                     &config.python,
                     &config.bridge_dir(),
                     &config.llama_cpp_dir,
                     socket.as_deref(),
-                    1,
                 )
                 .map(|merged| (Some(merged), None, true)),
         };
