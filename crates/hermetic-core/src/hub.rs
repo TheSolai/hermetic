@@ -345,6 +345,49 @@ impl Donor {
     }
 }
 
+/// The weights' own name, as queries for the hub.
+///
+/// A GGUF file calls itself `DeepSeek R1 0528 Qwen3 8B`; the hub calls it
+/// `DeepSeek-R1-0528-Qwen3-8B`. The name with the spaces in it was dropped,
+/// and with it went the only statement the weights make about what they are.
+///
+/// That statement matters more than the shape. A distilled model and the
+/// model it was distilled from have exactly the same shape - that is the
+/// whole point of a distillation - so the shape cannot tell them apart. But
+/// their refusal directions are their own, and an adapter abliterated on one
+/// of them turns the other into nonsense: the model loads, it answers, and
+/// what it says is not words.
+///
+/// So the name is asked for first, and the answer is the model itself.
+fn name_queries(hint: &Hint) -> Vec<String> {
+    let Some(name) = &hint.name else {
+        return Vec::new();
+    };
+    let parts: Vec<&str> = name.split([' ', '-']).filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut push = |value: String| {
+        if !value.is_empty() && !out.contains(&value) {
+            out.push(value);
+        }
+    };
+    // The whole name: `DeepSeek-R1-0528-Qwen3-8B`.
+    push(parts.join("-"));
+    // And the name without the words that describe a role: the repository
+    // that holds the weights is usually the one without them.
+    let trimmed: Vec<&str> = parts
+        .iter()
+        .copied()
+        .filter(|part| !ROLE_WORDS.contains(&part.to_lowercase().as_str()))
+        .collect();
+    if !trimmed.is_empty() {
+        push(trimmed.join("-"));
+    }
+    out
+}
+
 /// The obvious name: the architecture and the size.
 fn name_candidates(hint: &Hint) -> Vec<String> {
     let mut out = Vec::new();
@@ -706,7 +749,21 @@ fn shapes_of(candidates: &[String], exists: &[String]) -> Vec<(String, Shape)> {
 pub fn find_donor(target: &Signature, spec: &str, hint: &Hint) -> Donor {
     let mut candidates: Vec<String> = Vec::new();
 
-    // The shape comes first: it is the only thing that is actually right.
+    // The model the weights actually are comes first. The shape cannot tell a
+    // distilled model from the model it was distilled from - they are the
+    // same shape by construction - but the adapter has to be made on the
+    // right one, or the weights answer in nonsense.
+    for query in name_queries(hint) {
+        for repo in search(&query, 12) {
+            // A re-upload of quantised weights is not a donor: Heretic needs
+            // the original tensors, and a GGUF repo does not have them.
+            if !is_derivative(&repo) && !candidates.contains(&repo) {
+                candidates.push(repo);
+            }
+        }
+    }
+
+    // The shape comes next: it is the only thing that is actually right.
     // The matrix leads, because it reaches the donor without a search.
     candidates.extend(hf_candidates(spec, hint));
     candidates.extend(name_candidates(hint));

@@ -149,13 +149,26 @@ gated repository from one that was never there: it answers `401` for both. So
 the hub's own search is the oracle - a repository it returned exists - and
 `HF_TOKEN` unlocks the gated ones.
 
+### A distilled model is not the model it was distilled from
+
+`deepseek-r1:latest` is a distillation of `Qwen3-8B`, and the two have exactly
+the same shape - that is the whole point of a distillation. So the shape
+cannot tell them apart, and an adapter abliterated on `Qwen/Qwen3-8B` binds
+perfectly to the distillation's weights and turns them into nonsense: the
+model loads, it answers, and what it says is not words.
+
+So the weights are asked what they are. A GGUF file carries its own name -
+`DeepSeek R1 0528 Qwen3 8B` - and that is the truest statement there is, so
+the donor for a shape is the model the weights actually are. The name is the
+one that has spaces in it, and it is the one that used to be dropped.
+
 The search is tested against the real hub, not only against mocks:
 
 ```bash
 cargo test --release --test donor -- --ignored --nocapture
 # qwen2.5-coder:7b -> Qwen/Qwen2.5-Coder-7B
 # Qwen:latest       -> Qwen/Qwen2-beta-4B-Chat
-# deepseek-r1:latest -> Qwen/Qwen3-8B
+# deepseek-r1:latest -> deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
 ```
 
 ## What is in the box

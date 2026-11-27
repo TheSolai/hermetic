@@ -251,17 +251,27 @@ fn prepare(
         return Ok((None, None, false));
     };
 
-    // An embedding model is not a chat model. There is no chat endpoint to
-    // bind an adapter to, and saying so is better than an hour of looking
-    // for weights that will never be served.
+    // A model that does not answer questions cannot be talked to. Ollama
+    // says what a model is for - "completion", "embedding", "speech",
+    // "vision" - and a model without "completion" has no chat endpoint for
+    // an adapter to be bound to. Saying so is better than an hour of
+    // looking for weights that will never be served.
     let capabilities = spec::capabilities_of(source);
-    if capabilities.iter().any(|c| c == "embedding")
-        && !capabilities.iter().any(|c| c == "completion")
-    {
+    let talks = capabilities
+        .iter()
+        .any(|c| c == "completion" || c == "chat");
+    if !capabilities.is_empty() && !talks {
+        let kind = if capabilities.iter().any(|c| c == "speech") {
+            "a speech model"
+        } else if capabilities.iter().any(|c| c == "embedding") {
+            "an embedding model"
+        } else {
+            "not a chat model"
+        };
         anyhow::bail!(
-            "{spec_arg} is an embedding model, not a chat model.\n\
-             HERMETIC serves models you talk to: an embedding model has no chat \
-             endpoint for an adapter to be bound to."
+            "{spec_arg} is {kind}, not a chat model.\n\
+             HERMETIC serves models you talk to: this one has no chat endpoint for an \
+             adapter to be bound to."
         );
     }
 
