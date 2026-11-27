@@ -270,8 +270,11 @@ class _Question:
             if repeat and not CHANNEL.connected:
                 return ""
             return self.default
-        value = answer["answer"]
-        if self.kind == "select" and isinstance(value, int):
+        return self._resolve_with(answer["answer"])
+
+    def _resolve_with(self, value: Any) -> Any:
+        """Turn the client's answer into the object upstream expects."""
+        if self.kind == "select" and isinstance(value, int) and not isinstance(value, bool):
             # The client's answer is the first choice, which is the trial
             # upstream sorts first: the one that refuses not at all, even
             # when it has moved the model so far that it no longer speaks.
@@ -345,6 +348,16 @@ class QuestionServer:
                         best_total = total
                 if best_trial is not None:
                     default = objects[best_trial]
+                    total = _trial_total(objects[best_trial])
+                    number = (rendered[best_trial].get("trial") or {}).get("number")
+                    emit(
+                        "log",
+                        text=(
+                            f"keeping trial {number} - the trial with the lowest total "
+                            f"score"
+                            + (f" ({total:.3f})" if total is not None else "")
+                        ),
+                    )
         return _Question(
             "select", message, payload, default, objects, server=self, best_trial=best_trial
         )
@@ -494,6 +507,7 @@ def install() -> None:
     md.load_and_init_modifiers = load_and_init_modifiers  # type: ignore[assignment]
 
     _install_trust_seam()
+    _install_settings_seam()
 
     # questionary is imported at module scope by heretic.main and heretic.reproduce
     import heretic.main as hm
@@ -504,6 +518,55 @@ def install() -> None:
     for _name, _mod in list(sys.modules.items()):
         if _name.startswith("heretic.") and getattr(_mod, "questionary", None) is not None:
             _mod.questionary = shim  # type: ignore[attr-defined]
+
+
+def _install_settings_seam(settings_cls: Any = None) -> None:
+    """A resumed study must not resurrect a pinned trial.
+
+    Upstream stores the settings of the run that created a study *inside the
+    study*, and restores them when the study is resumed. That list includes
+    ``trial_index``: the index into the sorted Pareto front of the trial to
+    keep. A study created by a run with the trial pinned therefore hands that
+    pin to every run that resumes it, and the question "which trial do you
+    want to use?" is then never asked - upstream takes the first trial of the
+    sorted front without asking.
+
+    That first trial is the one that refuses not at all, whatever it has cost
+    the model: upstream sorts its Pareto front by the scorers one after
+    another, so a trial with no refusals at all comes first, even when it has
+    moved the model so far that it no longer speaks. (On gemma-2-2b that is
+    the difference between a KL divergence of 0.08 and one of 8.79 - the
+    first speaks, the second answers in gibberish.)
+
+    The pin is dropped here, so the question is always asked, and the bridge
+    answers it with the trial that keeps the model speaking. A pin that came
+    from the command line is honoured: only the fossil inside a study is
+    dropped.
+    """
+    if settings_cls is None:
+        try:
+            import heretic.config as hc
+        except Exception:
+            return
+        settings_cls = hc.Settings
+
+    original = getattr(settings_cls, "model_validate_init_only", None)
+    if original is None or getattr(original, "_hermetic_patched", False):
+        return
+
+    def model_validate_init_only(cls: Any, values: Any, current: Any) -> Any:
+        if isinstance(values, dict) and values.get("trial_index") is not None:
+            # The pin belongs to the run that asked for it, not to the study.
+            # Upstream restores the study's settings over the command line,
+            # so the pin has to be carried over explicitly.
+            values = dict(values)
+            values["trial_index"] = getattr(current, "trial_index", None)
+        return original.__func__(cls, values, current)
+
+    model_validate_init_only._hermetic_patched = True  # type: ignore[attr-defined]
+    settings_cls.model_validate_init_only = classmethod(  # type: ignore[method-assign]
+        model_validate_init_only
+    )
 
 
 def _install_trust_seam() -> None:
